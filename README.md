@@ -1,3 +1,6 @@
+<img width="1090" height="326" alt="image" src="https://github.com/user-attachments/assets/d10e5e5b-fcc6-4153-b3ab-6355e1787005" />
+
+
 # A-Share Multi-Dimensional Financial Model
 
 A complete financial time series prediction system with multi-dimensional conditional training for A-share stocks.
