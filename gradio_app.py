@@ -957,7 +957,7 @@ def build_cache_for_training(max_stocks=100, use_gpu=True):
         yield error_msg, error_fig
 
 
-def train_multi_dim_model(mode, industry, max_stocks, batch_size, epochs, lr,
+def train_multi_dim_model(mode, industry, max_stocks, hidden_dim, num_layers, batch_size, epochs, lr,
                           use_amp=True, loss_type="Trend Aware", save_interval=5, early_stopping_patience=50,
                           model_name="multi_dim_model", output_dir="checkpoints", use_cache=True, use_compile=False):
     """Train conditional multi dimensional model with real-time curve updates"""
@@ -971,8 +971,8 @@ def train_multi_dim_model(mode, industry, max_stocks, batch_size, epochs, lr,
         config = Config()
         config.model.seq_length = 60
         config.model.pred_length = 1
-        config.model.hidden_dim = 128
-        config.model.num_layers = 2
+        config.model.hidden_dim = int(hidden_dim)
+        config.model.num_layers = int(num_layers)
         config.training.batch_size = int(batch_size)
 
         loss_type_map = {
@@ -2996,6 +2996,19 @@ with gr.Blocks(title="A-Share Multi-Dimensional Financial Model", theme=gr.theme
                         label="最大股票数 / Max Stocks",
                         info="测试:10-50, 生产:100-500, 大规模:500-5000 / Test:10-50, Prod:100-500, Large:500-5000"
                     )
+
+                    multi_hidden_dim = gr.Slider(
+                        128, 1024, value=256, step=64,
+                        label="模型容量 Hidden Dim / Model Capacity",
+                        info="100股票:256, 500股票:512, 3000股票:768-1024 / Larger for more stocks"
+                    )
+
+                    multi_num_layers = gr.Slider(
+                        2, 8, value=4, step=1,
+                        label="网络层数 / Num Layers",
+                        info="层数越深，模型越强 / Deeper = More powerful"
+                    )
+
                     multi_batch_size = gr.Slider(
                         8, 128, value=64, step=8,
                         label="批次大小 / Batch Size",
@@ -3086,7 +3099,7 @@ with gr.Blocks(title="A-Share Multi-Dimensional Financial Model", theme=gr.theme
             multi_train_btn.click(
                 fn=train_multi_dim_model,
                 inputs=[
-                    training_mode, industry_filter, multi_max_stocks, multi_batch_size,
+                    training_mode, industry_filter, multi_max_stocks, multi_hidden_dim, multi_num_layers, multi_batch_size,
                     multi_epochs, multi_lr, multi_use_amp, multi_loss_type, multi_save_interval,
                     multi_early_stopping_patience, multi_model_name, multi_output_dir, multi_use_cache, multi_use_compile
                 ],
