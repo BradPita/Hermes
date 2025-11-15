@@ -1,0 +1,1756 @@
+"""
+Gradio Training and Inference Panel for Financial Model
+Bilingual (Chinese/English) Interface
+
+Author: eddy
+"""
+
+import gradio as gr
+import torch
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import os
+import sys
+import threading
+import time
+import json
+from datetime import datetime
+from pytdx.hq import TdxHq_API
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'financial_model'))
+
+from src.config import Config
+from src.model import create_model
+from src.dataset import create_sample_data, create_dataloaders
+from src.train import Trainer
+from src.inference import Predictor
+from src.conditional_inference import ConditionalPredictor
+from src.multi_dim_dataset import create_multi_dim_dataloaders, create_multi_dim_dataloaders_with_progress
+from src.stock_metadata import IndustryClassifier
+from src.market_regime import MarketRegimeDetector, IndexDataProvider
+
+global_trainer = None
+training_status = {"running": False, "epoch": 0, "train_loss": 0, "val_loss": 0}
+download_status = {"running": False, "progress": 0, "total": 0, "current_stock": ""}
+
+LANG = {
+    "zh": {
+        "title": "A股多维度金融模型训练系统",
+        "subtitle": "基于 PyTorch + Flash Attention 2.8.2 + CUDA 12.8",
+        "flash_status": "Flash Attention 状态",
+        "data_download_tab": "📥 数据下载",
+        "basic_training_tab": "🎯 基础训练",
+        "multi_dim_tab": "🎨 多维度训练",
+        "inference_tab": "🔮 模型推理",
+        "custom_data_tab": "📁 自定义数据",
+    },
+    "en": {
+        "title": "A-Share Multi-Dimensional Financial Model",
+        "subtitle": "Powered by PyTorch + Flash Attention 2.8.2 + CUDA 12.8",
+        "flash_status": "Flash Attention Status",
+        "data_download_tab": "📥 Data Download",
+        "basic_training_tab": "🎯 Basic Training",
+        "multi_dim_tab": "🎨 Multi-Dim Training",
+        "inference_tab": "🔮 Inference",
+        "custom_data_tab": "📁 Custom Data",
+    }
+}
+
+current_lang = "zh"
+
+def check_flash_attention():
+    """Check if Flash Attention is available / 检查 Flash Attention 是否可用"""
+    try:
+        import flash_attn
+        return f"✅ Flash Attention {flash_attn.__version__} 可用 / Available"
+    except ImportError:
+        return "❌ Flash Attention 不可用 / Not available"
+
+
+def get_available_stocks():
+    """Get list of available stock codes from training data directory"""
+    data_dir = "full_stock_data/training_data"
+
+    if not os.path.exists(data_dir):
+        return []
+
+    files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
+    stock_codes = sorted([f.replace('.csv', '') for f in files])
+
+    return stock_codes
+
+
+def get_available_checkpoints():
+    """List available checkpoint files for selection in the UI."""
+    base_dir = "financial_model/checkpoints"
+    if not os.path.exists(base_dir):
+        return []
+
+    files = [
+        f for f in os.listdir(base_dir)
+        if f.endswith(".pt") or f.endswith(".pth")
+    ]
+    files = sorted(files)
+    return [os.path.join(base_dir, f) for f in files]
+
+
+def get_stock_info(stock_code):
+    """Get information about a specific stock"""
+    if not stock_code or stock_code == "No stocks available - Please download data first":
+        return "Please select a valid stock code"
+
+    data_dir = "full_stock_data/training_data"
+    stock_file = os.path.join(data_dir, f"{stock_code}.csv")
+
+    if not os.path.exists(stock_file):
+        return f"Stock data file not found: {stock_code}"
+
+    try:
+        data = pd.read_csv(stock_file)
+
+        info = f"""
+Stock Information: {stock_code}
+{'='*60}
+Total Records: {len(data)} days
+Date Range: {data['date'].min()} to {data['date'].max()}
+Columns: {', '.join(data.columns.tolist())}
+
+Latest 5 days:
+{data.tail(5)[['date', 'open', 'high', 'low', 'close', 'volume']].to_string(index=False)}
+"""
+        return info
+    except Exception as e:
+        return f"Error reading stock data: {str(e)}"
+
+def check_data_status():
+    """Check downloaded data status"""
+    data_dir = "full_stock_data/training_data"
+    metadata_file = "full_stock_data/metadata.json"
+
+    if not os.path.exists(data_dir):
+        return "Data directory not found. Please download data first."
+
+    files = [f for f in os.listdir(data_dir) if f.endswith(".csv")]
+
+    if os.path.exists(metadata_file):
+        with open(metadata_file, 'r', encoding='utf-8') as f:
+            metadata = json.load(f)
+
+        info = f"""
+Dataset Status
+{'='*60}
+Downloaded: {len(metadata.get('downloaded_stocks', []))}
+Failed: {len(metadata.get('failed_stocks', []))}
+Total Records: {metadata.get('total_records', 0):,}
+Last Update: {metadata.get('last_update', 'N/A')}
+CSV Files: {len(files)}
+
+Available stocks for Basic Training:
+"""
+        stock_codes = get_available_stocks()
+        for i, code in enumerate(stock_codes[:20]):
+            info += f"  {code}"
+            if (i + 1) % 5 == 0:
+                info += "\n"
+
+        if len(stock_codes) > 20:
+            info += f"\n  ... and {len(stock_codes) - 20} more stocks\n"
+
+        return info
+    else:
+        return f"Found {len(files)} CSV files\nMetadata file not found"
+
+
+def get_stock_list():
+    """Get complete A-share stock list / 获取完整A股列表"""
+    stock_codes = []
+
+    for prefix in ['600', '601', '603', '605', '688']:
+        for i in range(1000):
+            code = f"SH{prefix}{i:03d}"
+            stock_codes.append(code)
+
+    for prefix in ['000', '001', '002', '003', '300', '301']:
+        for i in range(1000):
+            code = f"SZ{prefix}{i:03d}"
+            stock_codes.append(code)
+
+    return stock_codes
+
+
+def download_stock_data(max_stocks, start_date, progress=gr.Progress()):
+    """Download A-share stock data / 下载A股数据"""
+    global download_status
+
+    try:
+        download_status["running"] = True
+        download_status["progress"] = 0
+
+        data_dir = "full_stock_data/training_data"
+        os.makedirs(data_dir, exist_ok=True)
+
+        metadata_file = "full_stock_data/metadata.json"
+        if os.path.exists(metadata_file):
+            with open(metadata_file, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+        else:
+            metadata = {
+                "downloaded_stocks": [],
+                "failed_stocks": [],
+                "total_records": 0,
+                "last_update": ""
+            }
+
+        # Determine which stocks still need to be downloaded based on existing CSV files
+        existing_files = [
+            f.replace(".csv", "") for f in os.listdir(data_dir) if f.endswith(".csv")
+        ]
+        existing_set = set(existing_files)
+
+        all_codes = get_stock_list()
+        remaining_codes = [code for code in all_codes if code not in existing_set]
+
+        try:
+            max_stocks_int = int(max_stocks)
+        except Exception:
+            max_stocks_int = 50
+
+        if max_stocks_int <= 0:
+            max_stocks_int = len(remaining_codes)
+
+        stock_codes = remaining_codes[:max_stocks_int]
+        download_status["total"] = len(stock_codes)
+
+        if not stock_codes:
+            download_status["running"] = False
+            yield "No new stocks to download. Existing data is already complete for the current universe.\n"
+            return
+
+        yield (
+            "Starting incremental download\n"
+            f"Existing CSV files: {len(existing_files)}\n"
+            f"Planned new stocks this run: {len(stock_codes)}\n"
+            f"Start date: {start_date}\n\n"
+        )
+
+        api = TdxHq_API()
+        server = "124.71.187.122"
+        port = 7709
+
+        if not api.connect(server, port):
+            download_status["running"] = False
+            yield "❌ 连接TDX服务器失败 / Failed to connect to TDX server\n"
+            return
+
+        yield f"✅ 已连接到TDX服务器 / Connected to TDX server: {server}:{port}\n\n"
+
+        downloaded = 0
+        failed = 0
+
+        for idx, code in enumerate(stock_codes):
+            download_status["progress"] = idx + 1
+            download_status["current_stock"] = code
+
+            progress((idx + 1) / len(stock_codes), desc=f"下载中 / Downloading: {code}")
+
+            try:
+                market = 1 if code.startswith('SH') else 0
+                stock_code = code.replace('SH', '').replace('SZ', '')
+
+                data = api.get_security_bars(9, market, stock_code, 0, 1600)
+
+                if data and len(data) > 100:
+                    df = api.to_df(data)
+                    df = df[['datetime', 'open', 'high', 'low', 'close', 'vol']]
+                    df.columns = ['date', 'open', 'high', 'low', 'close', 'volume']
+                    df = df.sort_values('date')
+
+                    if start_date:
+                        df = df[df['date'] >= start_date]
+
+                    csv_path = os.path.join(data_dir, f"{code}.csv")
+                    df.to_csv(csv_path, index=False)
+
+                    downloaded += 1
+                    if code not in metadata["downloaded_stocks"]:
+                        metadata["downloaded_stocks"].append(code)
+                    metadata["total_records"] += len(df)
+
+                    if downloaded % 10 == 0:
+                        yield (
+                            f"Downloaded: {downloaded}/{len(stock_codes)} | "
+                            f"Failed: {failed}\nCurrent: {code} ({len(df)} records)\n"
+                        )
+                else:
+                    failed += 1
+                    if code not in metadata["failed_stocks"]:
+                        metadata["failed_stocks"].append(code)
+
+            except Exception as e:
+                failed += 1
+                metadata["failed_stocks"].append(code)
+                if failed % 20 == 0:
+                    yield f"⚠️ 失败 / Failed: {failed} | 最新错误 / Latest: {code}\n"
+
+        api.disconnect()
+
+        metadata["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(metadata_file, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+        download_status["running"] = False
+
+        summary = f"""
+{'='*60}
+✅ 下载完成 / Download Complete
+{'='*60}
+✅ 成功 / Success: {downloaded}
+❌ 失败 / Failed: {failed}
+📈 总记录数 / Total Records: {metadata['total_records']:,}
+📁 保存位置 / Saved to: {data_dir}
+🕐 完成时间 / Completed: {metadata['last_update']}
+"""
+        yield summary
+
+    except Exception as e:
+        download_status["running"] = False
+        yield f"❌ 下载出错 / Download error: {str(e)}\n"
+
+
+
+def inspect_download_plan(max_stocks, start_date):
+    """Inspect existing data and planned incremental download without downloading."""
+    data_dir = "full_stock_data/training_data"
+    os.makedirs(data_dir, exist_ok=True)
+
+    metadata_file = "full_stock_data/metadata.json"
+    if os.path.exists(metadata_file):
+        with open(metadata_file, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+    else:
+        metadata = {
+            "downloaded_stocks": [],
+            "failed_stocks": [],
+            "total_records": 0,
+            "last_update": "",
+        }
+
+    existing_files = [
+        f.replace(".csv", "") for f in os.listdir(data_dir) if f.endswith(".csv")
+    ]
+    existing_set = set(existing_files)
+
+    all_codes = get_stock_list()
+    remaining_codes = [code for code in all_codes if code not in existing_set]
+
+    try:
+        max_stocks_int = int(max_stocks)
+    except Exception:
+        max_stocks_int = 50
+
+    if max_stocks_int <= 0:
+        planned_new = len(remaining_codes)
+    else:
+        planned_new = min(max_stocks_int, len(remaining_codes))
+
+    sample_new = remaining_codes[: min(10, len(remaining_codes))]
+
+    info_lines = []
+    info_lines.append("A-Share Data Check")
+    info_lines.append("=" * 60)
+    info_lines.append(f"Existing CSV files: {len(existing_files)}")
+    info_lines.append(
+        f"Metadata downloaded stocks: {len(metadata.get('downloaded_stocks', []))}"
+    )
+    info_lines.append(
+        f"Failed stocks recorded: {len(metadata.get('failed_stocks', []))}"
+    )
+    info_lines.append(f"Total records: {metadata.get('total_records', 0):,}")
+    last_update = metadata.get("last_update") or "N/A"
+    info_lines.append(f"Last update: {last_update}")
+    info_lines.append("")
+    info_lines.append(f"Universe size (get_stock_list): {len(all_codes)}")
+    info_lines.append(
+        f"Remaining stocks without CSV: {len(remaining_codes)}"
+    )
+    info_lines.append(
+        f"Requested max new stocks this run: {max_stocks_int}"
+    )
+    info_lines.append(
+        f"Planned new stocks if you start download: {planned_new}"
+    )
+    info_lines.append(f"Start date: {start_date}")
+
+    if sample_new:
+        info_lines.append("")
+        info_lines.append("Sample of new stocks to download:")
+        info_lines.append(", ".join(sample_new))
+    else:
+        info_lines.append("")
+        info_lines.append(
+            "No remaining stocks to download. Existing data is already complete for the current universe."
+        )
+
+    return "\n".join(info_lines)
+
+def create_config(model_type, hidden_dim, num_layers, num_heads, batch_size, epochs, lr):
+    """
+    Create configuration from UI inputs
+    从UI输入创建配置
+
+    Args:
+        model_type: Model architecture (Transformer/LSTM) / 模型架构
+        hidden_dim: Hidden dimension size / 隐藏层维度
+        num_layers: Number of layers / 层数
+        num_heads: Number of attention heads (Transformer only) / 注意力头数
+        batch_size: Training batch size / 批次大小
+        epochs: Number of training epochs / 训练轮数
+        lr: Learning rate / 学习率
+    """
+    config = Config()
+    config.model.model_type = model_type.lower()
+    config.model.hidden_dim = hidden_dim
+    config.model.num_layers = num_layers
+    config.model.num_heads = num_heads
+    config.training.batch_size = batch_size
+    config.training.num_epochs = epochs
+    config.training.learning_rate = lr
+    return config
+
+def train_model(model_type, hidden_dim, num_layers, num_heads, batch_size, epochs, lr, stock_code):
+    """
+    Train model with real-time loss curve updates on real stock data
+    """
+    global global_trainer, training_status
+
+    try:
+        training_status["running"] = True
+        training_status["epoch"] = 0
+
+        config = create_config(model_type, hidden_dim, num_layers, num_heads, batch_size, epochs, lr)
+
+        data_dir = "full_stock_data/training_data"
+        stock_file = os.path.join(data_dir, f"{stock_code}.csv")
+
+        if not os.path.exists(stock_file):
+            error_fig = go.Figure()
+            error_fig.update_layout(title=f'Error: Stock {stock_code} not found')
+            yield f"Error: Stock data not found for {stock_code}\nFile: {stock_file}\n", error_fig
+            return
+
+        data = pd.read_csv(stock_file)
+
+        if len(data) < 100:
+            error_fig = go.Figure()
+            error_fig.update_layout(title='Error: Not enough data')
+            yield f"Error: Not enough data for {stock_code} (need at least 100 rows)\n", error_fig
+            return
+
+        train_loader, val_loader, test_loader, scaler = create_dataloaders(data, config)
+
+        global_trainer = Trainer(config)
+
+        model_params = sum(p.numel() for p in global_trainer.model.parameters())
+        device_info = f"Device: {config.model.device}"
+        if torch.cuda.is_available():
+            device_info += f" ({torch.cuda.get_device_name(0)})"
+
+        flash_status = check_flash_attention()
+
+        init_log = f"""
+Training Started
+{'='*60}
+{device_info}
+{flash_status}
+Stock: {stock_code}
+Data Points: {len(data)}
+Model: {model_type}
+Parameters: {model_params:,}
+Batch Size: {batch_size}
+Learning Rate: {lr}
+
+"""
+
+        init_fig = go.Figure()
+        init_fig.update_layout(
+            title='Training will start...',
+            xaxis_title='Epoch',
+            yaxis_title='Loss',
+            template='plotly_white'
+        )
+
+        yield init_log, init_fig
+
+        for epoch in range(config.training.num_epochs):
+            training_status["epoch"] = epoch + 1
+
+            train_loss = global_trainer.train_epoch(train_loader)
+            val_loss = global_trainer.validate(val_loader)
+
+            training_status["train_loss"] = train_loss
+            training_status["val_loss"] = val_loss
+
+            global_trainer.train_losses.append(train_loss)
+            global_trainer.val_losses.append(val_loss)
+
+            if val_loss < global_trainer.best_val_loss:
+                global_trainer.best_val_loss = val_loss
+                global_trainer.patience_counter = 0
+                global_trainer.save_checkpoint("best_model.pt")
+                status = "NEW BEST!"
+            else:
+                global_trainer.patience_counter += 1
+                status = ""
+
+            log_text = init_log + f"\nEpoch {epoch+1}/{config.training.num_epochs}\nTrain Loss: {train_loss:.6f}\nVal Loss: {val_loss:.6f} {status}\n"
+
+            fig = make_subplots(rows=1, cols=1)
+            epochs_list = list(range(1, len(global_trainer.train_losses) + 1))
+
+            fig.add_trace(go.Scatter(
+                x=epochs_list,
+                y=global_trainer.train_losses,
+                mode='lines+markers',
+                name='Train Loss',
+                line=dict(color='blue', width=2),
+                marker=dict(size=8)
+            ))
+
+            fig.add_trace(go.Scatter(
+                x=epochs_list,
+                y=global_trainer.val_losses,
+                mode='lines+markers',
+                name='Val Loss',
+                line=dict(color='red', width=2),
+                marker=dict(size=8)
+            ))
+
+            fig.update_layout(
+                title=f'Training Progress - Epoch {epoch+1}/{config.training.num_epochs}',
+                xaxis_title='Epoch',
+                yaxis_title='Loss',
+                hovermode='x unified',
+                template='plotly_white',
+                showlegend=True
+            )
+
+            yield log_text, fig
+
+            if global_trainer.patience_counter >= config.training.early_stopping_patience:
+                final_log = log_text + f"\nEarly stopping!\nBest Val Loss: {global_trainer.best_val_loss:.6f}\n"
+                yield final_log, fig
+                break
+
+        training_status["running"] = False
+        final_log = log_text + f"\nCompleted!\nBest Val Loss: {global_trainer.best_val_loss:.6f}\nSaved to: financial_model/checkpoints/best_model.pt\n"
+        yield final_log, fig
+
+    except Exception as e:
+        training_status["running"] = False
+        error_fig = go.Figure()
+        error_fig.update_layout(title='Training Error')
+        yield f"Error: {str(e)}\n", error_fig
+
+def plot_training_history():
+    """Plot training history"""
+    global global_trainer
+
+    if global_trainer is None or len(global_trainer.train_losses) == 0:
+        return None
+
+    fig = make_subplots(rows=1, cols=1)
+
+    epochs = list(range(1, len(global_trainer.train_losses) + 1))
+
+    fig.add_trace(go.Scatter(
+        x=epochs, y=global_trainer.train_losses,
+        mode='lines+markers', name='Train Loss',
+        line=dict(color='blue', width=2)
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=epochs, y=global_trainer.val_losses,
+        mode='lines+markers', name='Val Loss',
+        line=dict(color='red', width=2)
+    ))
+
+    fig.update_layout(
+        title='Training History',
+        xaxis_title='Epoch',
+        yaxis_title='Loss',
+        hovermode='x unified',
+        template='plotly_white'
+    )
+
+    return fig
+
+
+def get_stock_list_by_industry(industry, max_stocks, data_dir):
+    """Get stock codes filtered by industry."""
+    all_files = [f for f in os.listdir(data_dir) if f.endswith(".csv")]
+    all_codes = [f.replace(".csv", "") for f in all_files]
+
+    try:
+        max_stocks = int(max_stocks)
+    except Exception:
+        max_stocks = 50
+
+    if industry is None or industry == "all":
+        return all_codes[: max_stocks]
+
+    filtered_codes = []
+    for code in all_codes:
+        try:
+            industry_l1, _ = IndustryClassifier.get_industry(code)
+            if industry_l1 == industry:
+                filtered_codes.append(code)
+        except Exception:
+            continue
+
+    return filtered_codes[: max_stocks]
+
+
+def analyze_universe(max_stocks):
+    """Analyze industry, style, and market regime based on downloaded data."""
+    data_dir = "full_stock_data/training_data"
+    if not os.path.exists(data_dir):
+        return "Error: data directory 'full_stock_data/training_data' not found. Please run batch_download.py first.", None
+
+    try:
+        max_stocks = int(max_stocks)
+    except Exception:
+        max_stocks = 50
+
+    all_files = [f for f in os.listdir(data_dir) if f.endswith(".csv")]
+    if not all_files:
+        return "Error: no CSV files found in 'full_stock_data/training_data'.", None
+
+    codes = [f.replace(".csv", "") for f in all_files][:max_stocks]
+
+    industry_counts = {}
+    volatility_counts = {"low_vol": 0, "medium_vol": 0, "high_vol": 0}
+
+    for code in codes:
+        try:
+            industry_l1, industry_l2 = IndustryClassifier.get_industry(code)
+            key = industry_l1
+            industry_counts[key] = industry_counts.get(key, 0) + 1
+
+            csv_path = os.path.join(data_dir, f"{code}.csv")
+            df = pd.read_csv(csv_path)
+            if "close" in df.columns and len(df) > 40:
+                returns = df["close"].pct_change()
+                vol_20d = returns.rolling(window=20).std().iloc[-1]
+                if pd.isna(vol_20d):
+                    continue
+                if vol_20d < 0.01:
+                    bucket = "low_vol"
+                elif vol_20d < 0.02:
+                    bucket = "medium_vol"
+                else:
+                    bucket = "high_vol"
+                volatility_counts[bucket] += 1
+        except Exception:
+            continue
+
+    # Market regime analysis using index data provider
+    try:
+        index_df = IndexDataProvider.get_index_data()
+        detector = MarketRegimeDetector()
+        current_regime = detector.detect_regime(index_df["close"])
+        regime_series = detector.detect_regime_series(index_df["close"])
+        regime_counts = regime_series.value_counts().to_dict()
+    except Exception:
+        current_regime = "unknown"
+        regime_counts = {}
+
+    lines = []
+    lines.append(f"Total CSV files in data directory: {len(all_files)}")
+    lines.append(f"Analyzed stocks: {len(codes)} (max_stocks={max_stocks})")
+    lines.append("")
+    lines.append("Industry distribution (level 1):")
+    for name, count in sorted(industry_counts.items(), key=lambda x: x[0]):
+        lines.append(f"  - {name}: {count}")
+    lines.append("")
+    lines.append("Volatility style (20 day standard deviation):")
+    for name in ["low_vol", "medium_vol", "high_vol"]:
+        lines.append(f"  - {name}: {volatility_counts[name]}")
+    lines.append("")
+    lines.append(f"Current market regime: {current_regime}")
+    if regime_counts:
+        lines.append("Historical market regimes:")
+        for name, count in regime_counts.items():
+            lines.append(f"  - {name}: {count}")
+
+    summary_text = "\n".join(lines)
+
+    # Create summary plot
+    cols = 2
+    fig = make_subplots(rows=1, cols=cols, subplot_titles=("Industry distribution", "Volatility styles"))
+
+    if industry_counts:
+        fig.add_trace(
+            go.Bar(
+                x=list(industry_counts.keys()),
+                y=list(industry_counts.values()),
+                name="Industry",
+            ),
+            row=1,
+            col=1,
+        )
+
+    fig.add_trace(
+        go.Bar(
+            x=["low_vol", "medium_vol", "high_vol"],
+            y=[
+                volatility_counts["low_vol"],
+                volatility_counts["medium_vol"],
+                volatility_counts["high_vol"],
+            ],
+            name="Volatility",
+        ),
+        row=1,
+        col=2,
+    )
+
+    fig.update_layout(
+        title="Universe analysis (industry and volatility)",
+        template="plotly_white",
+    )
+
+    return summary_text, fig
+
+
+def train_multi_dim_model(mode, industry, max_stocks, batch_size, epochs, lr,
+                          use_amp=True, loss_type="Trend Aware", save_interval=5,
+                          model_name="multi_dim_model", output_dir="checkpoints"):
+    """Train conditional multi dimensional model with real-time curve updates"""
+    global global_trainer, training_status
+
+    try:
+        training_status["running"] = True
+        training_status["epoch"] = 0
+
+        config = Config()
+        config.model.seq_length = 60
+        config.model.pred_length = 1
+        config.model.hidden_dim = 128
+        config.model.num_layers = 2
+        config.training.batch_size = int(batch_size)
+
+        loss_type_map = {
+            "MSE": "mse",
+            "Trend Aware": "trend_aware",
+            "Huber Trend": "huber_trend",
+            "Directional": "directional"
+        }
+        config.training.loss_type = loss_type_map.get(loss_type, "trend_aware")
+        config.training.num_epochs = int(epochs)
+        config.training.learning_rate = float(lr)
+        config.training.use_amp = bool(use_amp)
+
+        save_interval = int(save_interval)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_name_with_timestamp = f"{model_name}_{timestamp}"
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        data_dir = "full_stock_data/training_data"
+        if not os.path.exists(data_dir):
+            training_status["running"] = False
+            error_fig = go.Figure()
+            error_fig.update_layout(title='Error: Data directory not found')
+            yield "Error: data directory not found\n", error_fig
+            return
+
+        try:
+            max_stocks = int(max_stocks)
+        except Exception:
+            max_stocks = 100
+
+        if mode.startswith("Single"):
+            if not industry or industry == "all":
+                training_status["running"] = False
+                error_fig = go.Figure()
+                error_fig.update_layout(title='Error: Select industry')
+                yield "Error: select an industry\n", error_fig
+                return
+            stock_codes = get_stock_list_by_industry(industry, max_stocks, data_dir)
+        else:
+            stock_codes = get_stock_list_by_industry("all", max_stocks, data_dir)
+
+        if not stock_codes:
+            training_status["running"] = False
+            error_fig = go.Figure()
+            error_fig.update_layout(title='Error: No stocks available')
+            yield "Error: no stocks available\n", error_fig
+            return
+
+        loading_log = f"Loading {len(stock_codes)} stocks from {data_dir}...\n"
+
+        loading_fig = go.Figure()
+        loading_fig.update_layout(
+            title='Preparing to load stock data...',
+            template='plotly_white'
+        )
+        yield loading_log, loading_fig
+
+        train_loader = None
+        val_loader = None
+        test_loader = None
+
+        try:
+            for status, current, total, msg, tl, vl, tel in create_multi_dim_dataloaders_with_progress(
+                stock_codes,
+                config,
+                data_dir=data_dir,
+                use_gpu_normalize=True
+            ):
+                if status == 'loading':
+                    loading_log += f"{msg}\n"
+
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(
+                        x=['Loaded'],
+                        y=[current],
+                        text=[f'{current}/{total}'],
+                        textposition='auto',
+                        marker=dict(color='#4CAF50')
+                    ))
+                    fig.update_layout(
+                        title=f'Loading Progress: {current}/{total} stocks ({current*100//total}%)',
+                        yaxis=dict(range=[0, total], title='Stocks'),
+                        template='plotly_white',
+                        showlegend=False,
+                        height=400
+                    )
+                    yield loading_log, fig
+
+                elif status == 'complete':
+                    train_loader = tl
+                    val_loader = vl
+                    test_loader = tel
+                    loading_log += f"\n{msg}\nTrain batches: {len(train_loader)}\nVal batches: {len(val_loader)}\n"
+                    yield loading_log, fig
+
+        except Exception as e:
+            import traceback
+            training_status["running"] = False
+            error_fig = go.Figure()
+            error_fig.update_layout(title='Error loading data')
+            error_msg = f"Error loading data:\n{str(e)}\n\nTraceback:\n{traceback.format_exc()}\n"
+            yield error_msg, error_fig
+            return
+
+        if train_loader is None or len(train_loader) == 0:
+            training_status["running"] = False
+            error_fig = go.Figure()
+            error_fig.update_layout(title='Error: Empty dataloader')
+            yield "Error: empty dataloader\n", error_fig
+            return
+
+        global_trainer = Trainer(config, use_conditional=True)
+
+        model_params = sum(p.numel() for p in global_trainer.model.parameters())
+        model_device = str(next(global_trainer.model.parameters()).device)
+
+        device_info = f"Config Device: {config.model.device}"
+        if torch.cuda.is_available():
+            device_info += f"\nGPU: {torch.cuda.get_device_name(0)}"
+            device_info += f"\nGPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB"
+            device_info += f"\nModel Device: {model_device}"
+
+        flash_status = check_flash_attention()
+
+        if mode.startswith("Single"):
+            mode_desc = f"Single industry: {industry}"
+        else:
+            mode_desc = "Unified model (all industries)"
+
+        data_files = [f for f in os.listdir(data_dir) if f.endswith(".csv")]
+        header = (
+            f"Multi-Dimensional Training\n"
+            f"{'='*60}\n"
+            f"{device_info}\n"
+            f"{flash_status}\n"
+            f"Mode: {mode_desc}\n"
+            f"Model Name: {model_name_with_timestamp}\n"
+            f"Output Dir: {output_dir}\n"
+            f"Save Interval: Every {save_interval} epochs\n"
+            f"Loss Function: {loss_type} ({config.training.loss_type})\n"
+            f"Data dir: {data_dir} (CSV files: {len(data_files)})\n"
+            f"Stocks used this run: {len(stock_codes)}\n"
+            f"Train batches: {len(train_loader)}\n"
+            f"Val batches: {len(val_loader)}\n"
+            f"Parameters: {model_params:,}\n"
+            f"Use AMP (Mixed Precision): {config.training.use_amp}\n"
+            f"Batch Size: {config.training.batch_size}\n"
+            f"Learning Rate: {config.training.learning_rate}\n"
+            f"Epochs: {config.training.num_epochs}\n\n"
+        )
+
+        init_fig = go.Figure()
+        init_fig.update_layout(
+            title='Training will start...',
+            xaxis_title='Epoch',
+            yaxis_title='Loss',
+            template='plotly_white'
+        )
+
+        yield header, init_fig
+
+        for epoch in range(config.training.num_epochs):
+            training_status["epoch"] = epoch + 1
+
+            train_loss = global_trainer.train_epoch(train_loader)
+            val_loss = global_trainer.validate(val_loader)
+
+            training_status["train_loss"] = train_loss
+            training_status["val_loss"] = val_loss
+
+            global_trainer.train_losses.append(train_loss)
+            global_trainer.val_losses.append(val_loss)
+
+            save_info = ""
+
+            if val_loss < global_trainer.best_val_loss:
+                global_trainer.best_val_loss = val_loss
+                global_trainer.patience_counter = 0
+                best_model_path = os.path.join(output_dir, f"{model_name_with_timestamp}_best.pt")
+                global_trainer.save_checkpoint(best_model_path)
+                status = "NEW BEST"
+                save_info = f" -> Saved to {best_model_path}"
+            else:
+                global_trainer.patience_counter += 1
+                status = ""
+
+            if (epoch + 1) % save_interval == 0:
+                interval_model_path = os.path.join(output_dir, f"{model_name_with_timestamp}_epoch{epoch+1}.pt")
+                global_trainer.save_checkpoint(interval_model_path)
+                save_info += f" -> Checkpoint saved to {interval_model_path}"
+
+            log_text = header + f"\nEpoch {epoch + 1}/{config.training.num_epochs}\nTrain Loss: {train_loss:.6f}\nVal Loss: {val_loss:.6f} {status}{save_info}\n"
+
+            fig = make_subplots(rows=1, cols=1)
+            epochs_list = list(range(1, len(global_trainer.train_losses) + 1))
+
+            fig.add_trace(go.Scatter(
+                x=epochs_list,
+                y=global_trainer.train_losses,
+                mode='lines+markers',
+                name='Train Loss',
+                line=dict(color='blue', width=2),
+                marker=dict(size=8)
+            ))
+
+            fig.add_trace(go.Scatter(
+                x=epochs_list,
+                y=global_trainer.val_losses,
+                mode='lines+markers',
+                name='Val Loss',
+                line=dict(color='red', width=2),
+                marker=dict(size=8)
+            ))
+
+            fig.update_layout(
+                title=f'Multi-Dim Training - Epoch {epoch+1}/{config.training.num_epochs}',
+                xaxis_title='Epoch',
+                yaxis_title='Loss',
+                hovermode='x unified',
+                template='plotly_white',
+                showlegend=True
+            )
+
+            yield log_text, fig
+
+            if global_trainer.patience_counter >= config.training.early_stopping_patience:
+                final_model_path = os.path.join(output_dir, f"{model_name_with_timestamp}_final.pt")
+                global_trainer.save_checkpoint(final_model_path)
+                best_model_path = os.path.join(output_dir, f"{model_name_with_timestamp}_best.pt")
+                final_log = (
+                    log_text +
+                    f"\nEarly stopping!\n"
+                    f"Best Val Loss: {global_trainer.best_val_loss:.6f}\n"
+                    f"Best model: {best_model_path}\n"
+                    f"Final model: {final_model_path}\n"
+                )
+                yield final_log, fig
+                break
+
+        training_status["running"] = False
+
+        final_model_path = os.path.join(output_dir, f"{model_name_with_timestamp}_final.pt")
+        global_trainer.save_checkpoint(final_model_path)
+        best_model_path = os.path.join(output_dir, f"{model_name_with_timestamp}_best.pt")
+
+        final_log = (
+            log_text +
+            f"\nTraining Completed!\n"
+            f"Best Val Loss: {global_trainer.best_val_loss:.6f}\n"
+            f"Best model: {best_model_path}\n"
+            f"Final model: {final_model_path}\n"
+            f"Output directory: {output_dir}\n"
+        )
+        yield final_log, fig
+
+    except Exception as e:
+        import traceback
+        training_status["running"] = False
+        error_fig = go.Figure()
+        error_fig.update_layout(title='Training Error')
+        error_msg = f"Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}\n"
+        yield error_msg, error_fig
+
+
+def run_inference(checkpoint_path, num_samples):
+    """Run inference on test data"""
+    try:
+        if not os.path.exists(checkpoint_path):
+            return "Error: Checkpoint not found. Please train a model first.", None
+
+        predictor = Predictor(checkpoint_path)
+
+        test_data = create_sample_data(num_samples=num_samples)
+
+        predictions = predictor.predict_from_dataframe(test_data)
+
+        actual_values = test_data['close'].values[-len(predictions):]
+
+        fig = make_subplots(rows=1, cols=1)
+
+        indices = list(range(len(predictions)))
+
+        fig.add_trace(go.Scatter(
+            x=indices, y=actual_values,
+            mode='lines', name='Actual',
+            line=dict(color='blue', width=2)
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=indices, y=predictions,
+            mode='lines', name='Predicted',
+            line=dict(color='red', width=2, dash='dash')
+        ))
+
+        fig.update_layout(
+            title='Predictions vs Actual',
+            xaxis_title='Sample',
+            yaxis_title='Price',
+            hovermode='x unified',
+            template='plotly_white'
+        )
+
+        mse = np.mean((predictions - actual_values) ** 2)
+        mae = np.mean(np.abs(predictions - actual_values))
+
+        result = f"""
+Inference Results:
+==================
+Samples: {len(predictions)}
+MSE: {mse:.6f}
+MAE: {mae:.6f}
+
+Sample Predictions:
+{pd.DataFrame({
+    'Actual': actual_values[:10],
+    'Predicted': predictions[:10],
+    'Error': np.abs(actual_values[:10] - predictions[:10])
+}).to_string()}
+"""
+
+        return result, fig
+
+    except Exception as e:
+        return f"Error during inference: {str(e)}", None
+
+def upload_data_and_predict(file, checkpoint_path):
+    """Upload CSV and run predictions"""
+    try:
+        if file is None:
+            return "Please upload a CSV file", None
+
+        if not os.path.exists(checkpoint_path):
+            return "Error: Checkpoint not found. Please train a model first.", None
+
+        data = pd.read_csv(file.name)
+
+        predictor = Predictor(checkpoint_path)
+        predictions = predictor.predict_from_dataframe(data)
+
+        result_df = pd.DataFrame({
+            'Prediction': predictions
+        })
+
+        output_path = "predictions.csv"
+        result_df.to_csv(output_path, index=False)
+
+        return f"Predictions saved to {output_path}\n\nFirst 10 predictions:\n{result_df.head(10).to_string()}", output_path
+
+    except Exception as e:
+        return f"Error: {str(e)}", None
+
+def predict_single_stock(stock_code, future_days, checkpoint_path):
+    """Predict future prices for a single stock"""
+    try:
+        if not os.path.exists(checkpoint_path):
+            return "Error: Checkpoint not found. Please train a model first.", None
+
+        data_dir = "full_stock_data/training_data"
+        stock_file = os.path.join(data_dir, f"{stock_code}.csv")
+
+        if not os.path.exists(stock_file):
+            return f"Error: Stock data not found for {stock_code}", None
+
+        data = pd.read_csv(stock_file)
+
+        if len(data) < 60:
+            return f"Error: Not enough data for {stock_code} (need at least 60 rows)", None
+
+        predictor = ConditionalPredictor(checkpoint_path)
+
+        predictions, metadata = predictor.predict_stock(
+            stock_code=stock_code,
+            recent_data=data,
+            future_steps=int(future_days)
+        )
+
+        fig = make_subplots(rows=1, cols=1)
+
+        historical_prices = data['close'].tail(60).values
+        historical_dates = list(range(-len(historical_prices), 0))
+        future_dates = list(range(1, len(predictions) + 1))
+
+        fig.add_trace(go.Scatter(
+            x=historical_dates,
+            y=historical_prices,
+            mode='lines',
+            name='Historical',
+            line=dict(color='blue', width=2)
+        ))
+
+        last_price = historical_prices[-1]
+        fig.add_trace(go.Scatter(
+            x=[0] + future_dates,
+            y=[last_price] + list(predictions),
+            mode='lines+markers',
+            name='Predicted',
+            line=dict(color='red', width=2, dash='dash'),
+            marker=dict(size=8)
+        ))
+
+        fig.update_layout(
+            title=f'{stock_code} Price Prediction',
+            xaxis_title='Days (0=Today)',
+            yaxis_title='Price',
+            hovermode='x unified',
+            template='plotly_white'
+        )
+
+        result = f"""
+Stock Prediction Results
+========================
+Stock Code: {metadata['stock_code']}
+Industry: {metadata['industry_l1']} / {metadata['industry_l2']}
+Style: {metadata['style']} (Volatility: {metadata['volatility']:.4f})
+Market Regime: {metadata['regime']}
+
+Current Price: {metadata['last_price']:.2f}
+
+Future Predictions:
+"""
+        for i, pred in enumerate(predictions, 1):
+            change = ((pred - metadata['last_price']) / metadata['last_price']) * 100
+            result += f"  Day {i}: {pred:.2f} ({change:+.2f}%)\n"
+
+        return result, fig
+
+    except Exception as e:
+        import traceback
+        return f"Error: {str(e)}\n\n{traceback.format_exc()}", None
+
+with gr.Blocks(title="A-Share Multi-Dimensional Financial Model", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 🚀 A股多维度金融模型训练系统 / A-Share Multi-Dimensional Financial Model")
+    gr.Markdown("### 基于 PyTorch + Flash Attention 2.8.2 + CUDA 12.8 / Powered by PyTorch + Flash Attention 2.8.2 + CUDA 12.8")
+
+    with gr.Row():
+        flash_status_box = gr.Textbox(value=check_flash_attention(), label="Flash Attention 状态 / Status", interactive=False)
+        data_status_box = gr.Textbox(value=check_data_status(), label="数据集状态 / Dataset Status", interactive=False, lines=8)
+
+    with gr.Tabs():
+        with gr.Tab("📥 数据下载 / Data Download"):
+            gr.Markdown("""
+            ## 📥 A股历史数据下载 / A-Share Historical Data Download
+
+            **数据源 / Data Source:** 通达信TDX服务器 / TDX Server (124.71.187.122:7709)
+
+            **数据格式 / Data Format:**
+            - 日期 / Date
+            - 开盘价 / Open
+            - 最高价 / High
+            - 最低价 / Low
+            - 收盘价 / Close
+            - 成交量 / Volume
+
+            **覆盖范围 / Coverage:**
+            - 上海A股 / Shanghai A-Share: 600xxx, 601xxx, 603xxx, 605xxx, 688xxx
+            - 深圳A股 / Shenzhen A-Share: 000xxx, 001xxx, 002xxx, 003xxx, 300xxx, 301xxx
+            """)
+
+            with gr.Row():
+                with gr.Column():
+                    download_max_stocks = gr.Slider(
+                        10, 5000, value=100, step=10,
+                        label="下载股票数量 / Number of Stocks",
+                        info="建议先下载100只测试 / Recommend 100 for testing"
+                    )
+                    download_start_date = gr.Textbox(
+                        value="1999-01-01",
+                        label="起始日期 / Start Date",
+                        info="格式 / Format: YYYY-MM-DD"
+                    )
+                    inspect_download_btn = gr.Button(
+                        "Check Existing Data",
+                        variant="secondary",
+                    )
+                    download_btn = gr.Button("🚀 开始下载 / Start Download", variant="primary", size="lg")
+                    refresh_status_btn = gr.Button("🔄 刷新状态 / Refresh Status", variant="secondary")
+
+                with gr.Column():
+                    download_output = gr.Textbox(
+                        label="下载日志 / Download Log",
+                        lines=20,
+                        max_lines=25
+                    )
+
+            inspect_download_btn.click(
+                fn=inspect_download_plan,
+                inputs=[download_max_stocks, download_start_date],
+                outputs=download_output,
+            )
+
+            download_btn.click(
+                fn=download_stock_data,
+                inputs=[download_max_stocks, download_start_date],
+                outputs=download_output
+            )
+
+            refresh_status_btn.click(
+                fn=check_data_status,
+                outputs=data_status_box
+            )
+
+        with gr.Tab("🎯 Basic Training"):
+            gr.Markdown("""
+            ## 🎯 Single Stock Model Training
+
+            **Train a basic model on real stock data**
+
+            **Features:**
+            - Uses real stock data from `full_stock_data/training_data/`
+            - Train on single stock OHLCV data
+            - Real-time training curve visualization
+            - Supports Transformer (with Flash Attention) or LSTM
+
+            **Training Process:**
+            1. Load real stock data (OHLCV)
+            2. Normalize data (StandardScaler)
+            3. Create sequences (60 days → predict 1 day)
+            4. Train with AdamW optimizer
+            5. Early stopping (patience=10)
+
+            **Model Architecture:**
+            - **Transformer**: Multi-head attention with Flash Attention acceleration
+            - **LSTM**: Traditional recurrent network, faster training
+
+            **Data Split:**
+            - Train: 70% | Validation: 15% | Test: 15%
+            """)
+
+            with gr.Row():
+                with gr.Column():
+                    model_type = gr.Radio(
+                        ["Transformer", "LSTM"],
+                        value="Transformer",
+                        label="模型类型 / Model Type",
+                        info="Transformer使用Flash Attention / Transformer uses Flash Attention"
+                    )
+                    hidden_dim = gr.Slider(
+                        64, 512, value=256, step=64,
+                        label="隐藏层维度 / Hidden Dimension",
+                        info="更大=更强表达能力 / Larger = More capacity"
+                    )
+                    num_layers = gr.Slider(
+                        1, 8, value=4, step=1,
+                        label="网络层数 / Number of Layers",
+                        info="更深=更复杂模式 / Deeper = More complex patterns"
+                    )
+                    num_heads = gr.Slider(
+                        2, 16, value=8, step=2,
+                        label="注意力头数 / Attention Heads",
+                        info="仅Transformer / Transformer only"
+                    )
+
+                with gr.Column():
+                    batch_size = gr.Slider(
+                        8, 128, value=32, step=8,
+                        label="批次大小 / Batch Size",
+                        info="RTX 5090建议64-128 / RTX 5090: 64-128"
+                    )
+                    epochs = gr.Slider(
+                        1, 100, value=10, step=1,
+                        label="训练轮数 / Epochs",
+                        info="通常10-50轮足够 / Usually 10-50 is enough"
+                    )
+                    lr = gr.Number(
+                        value=0.001,
+                        label="Learning Rate",
+                        info="Default 0.001, fine-tune 0.0001"
+                    )
+
+                    available_stocks = get_available_stocks()
+                    if not available_stocks:
+                        available_stocks = ["No stocks available - Please download data first"]
+
+                    stock_code_dropdown = gr.Dropdown(
+                        choices=available_stocks,
+                        value=available_stocks[0] if available_stocks else None,
+                        label="Stock Code",
+                        info=f"Select from {len(available_stocks)} available stocks",
+                        allow_custom_value=False
+                    )
+
+                    stock_info_display = gr.Textbox(
+                        label="Stock Data Info",
+                        lines=10,
+                        interactive=False,
+                        value=get_stock_info(available_stocks[0]) if available_stocks else ""
+                    )
+
+            stock_code_dropdown.change(
+                fn=get_stock_info,
+                inputs=[stock_code_dropdown],
+                outputs=[stock_info_display]
+            )
+
+            train_btn = gr.Button("🚀 Start Training", variant="primary", size="lg")
+
+            with gr.Row():
+                with gr.Column():
+                    train_output = gr.Textbox(label="Training Log", lines=15, max_lines=20)
+                with gr.Column():
+                    plot_output = gr.Plot(label="Real-time Training Curve")
+
+            train_btn.click(
+                fn=train_model,
+                inputs=[model_type, hidden_dim, num_layers, num_heads, batch_size, epochs, lr, stock_code_dropdown],
+                outputs=[train_output, plot_output]
+            )
+
+        with gr.Tab("🔮 Inference"):
+            gr.Markdown("## Model Inference")
+
+            with gr.Row():
+                available_checkpoints_infer = get_available_checkpoints()
+                default_ckpt_infer = "financial_model/checkpoints/best_model.pt"
+                if default_ckpt_infer not in available_checkpoints_infer:
+                    available_checkpoints_infer = [
+                        default_ckpt_infer,
+                        *[p for p in available_checkpoints_infer if p != default_ckpt_infer],
+                    ]
+
+                checkpoint_path = gr.Dropdown(
+                    choices=available_checkpoints_infer,
+                    value=available_checkpoints_infer[0] if available_checkpoints_infer else default_ckpt_infer,
+                    label="Checkpoint Path",
+                    info="Select an existing checkpoint or type a custom path",
+                    allow_custom_value=True,
+                )
+                test_samples = gr.Slider(100, 1000, value=200, step=50, label="Test Samples")
+
+            inference_btn = gr.Button("🔮 Run Inference", variant="primary", size="lg")
+
+            with gr.Row():
+                inference_output = gr.Textbox(label="Inference Results", lines=15)
+
+            with gr.Row():
+                inference_plot = gr.Plot(label="Predictions vs Actual")
+
+            inference_btn.click(
+                fn=run_inference,
+                inputs=[checkpoint_path, test_samples],
+                outputs=[inference_output, inference_plot]
+            )
+
+        with gr.Tab("📈 Single Stock Prediction"):
+            gr.Markdown("""
+            ## 📈 Single Stock Future Prediction
+
+            **Predict future prices for a specific stock using the trained conditional model**
+
+            Features:
+            - Multi-day future prediction (1-30 days)
+            - Industry, style, and market regime aware
+            - Visual comparison with historical prices
+            - Percentage change analysis
+            """)
+
+            with gr.Row():
+                with gr.Column():
+                    available_stocks_predict = get_available_stocks()
+                    if not available_stocks_predict:
+                        available_stocks_predict = ["No stocks available"]
+
+                    stock_code_predict_dropdown = gr.Dropdown(
+                        choices=available_stocks_predict,
+                        value=available_stocks_predict[0] if available_stocks_predict else None,
+                        label="Stock Code",
+                        info=f"Select from {len(available_stocks_predict)} available stocks",
+                        allow_custom_value=False
+                    )
+
+                    stock_info_predict_display = gr.Textbox(
+                        label="Stock Data Info",
+                        lines=8,
+                        interactive=False,
+                        value=get_stock_info(available_stocks_predict[0]) if available_stocks_predict else ""
+                    )
+
+                    future_days_input = gr.Slider(
+                        1, 30, value=5, step=1,
+                        label="Future Days to Predict",
+                        info="Number of days to predict into the future"
+                    )
+
+                    available_checkpoints_single = get_available_checkpoints()
+                    default_ckpt_single = "financial_model/checkpoints/conditional_best_model.pt"
+                    if default_ckpt_single not in available_checkpoints_single:
+                        available_checkpoints_single = [
+                            default_ckpt_single,
+                            *[p for p in available_checkpoints_single if p != default_ckpt_single],
+                        ]
+
+                    checkpoint_path_single = gr.Dropdown(
+                        choices=available_checkpoints_single,
+                        value=available_checkpoints_single[0] if available_checkpoints_single else default_ckpt_single,
+                        label="Checkpoint Path",
+                        info="Path to trained conditional model (select or type)",
+                        allow_custom_value=True,
+                    )
+
+                with gr.Column():
+                    predict_single_btn = gr.Button("🔮 Predict Future", variant="primary", size="lg")
+
+            stock_code_predict_dropdown.change(
+                fn=get_stock_info,
+                inputs=[stock_code_predict_dropdown],
+                outputs=[stock_info_predict_display]
+            )
+
+            with gr.Row():
+                single_stock_output = gr.Textbox(label="Prediction Results", lines=15)
+
+            with gr.Row():
+                single_stock_plot = gr.Plot(label="Historical vs Predicted Prices")
+
+            predict_single_btn.click(
+                fn=predict_single_stock,
+                inputs=[stock_code_predict_dropdown, future_days_input, checkpoint_path_single],
+                outputs=[single_stock_output, single_stock_plot]
+            )
+
+        with gr.Tab("📁 Custom Data"):
+            gr.Markdown("## Upload Your Data for Prediction")
+            gr.Markdown("CSV format: `date,open,high,low,close,volume`")
+
+            with gr.Row():
+                file_input = gr.File(label="Upload CSV File", file_types=[".csv"])
+
+                available_checkpoints_custom = get_available_checkpoints()
+                default_ckpt_custom = "financial_model/checkpoints/best_model.pt"
+                if default_ckpt_custom not in available_checkpoints_custom:
+                    available_checkpoints_custom = [
+                        default_ckpt_custom,
+                        *[p for p in available_checkpoints_custom if p != default_ckpt_custom],
+                    ]
+
+                checkpoint_path_custom = gr.Dropdown(
+                    choices=available_checkpoints_custom,
+                    value=available_checkpoints_custom[0] if available_checkpoints_custom else default_ckpt_custom,
+                    label="Checkpoint Path",
+                    info="Select an existing checkpoint or type a custom path",
+                    allow_custom_value=True,
+                )
+
+            predict_btn = gr.Button("📊 Predict", variant="primary", size="lg")
+
+            with gr.Row():
+                custom_output = gr.Textbox(label="Results", lines=10)
+                download_output = gr.File(label="Download Predictions")
+
+            predict_btn.click(
+                fn=upload_data_and_predict,
+                inputs=[file_input, checkpoint_path_custom],
+                outputs=[custom_output, download_output]
+            )
+
+        with gr.Tab("🎨 多维度训练 / Multi-Dimensional Training"):
+            gr.Markdown("""
+            ## 🎨 多维度条件化模型训练 / Multi-Dimensional Conditional Model Training
+
+            **核心思想 / Core Concept:**
+            不同行业、不同风格、不同市场环境下的股票，其价格驱动逻辑完全不同。
+            Stocks in different industries, styles, and market regimes have completely different price dynamics.
+
+            **三大维度 / Three Dimensions:**
+
+            1. **行业板块 / Industry Sector (11类 / 11 categories)**
+               - 金融 / Finance: 银行、保险、券商 / Banks, Insurance, Securities
+               - 消费 / Consumer: 白酒、食品、零售 / Liquor, Food, Retail
+               - 科技 / Technology: 芯片、软件、通信 / Chips, Software, Telecom
+               - 医药 / Healthcare: 制药、医疗器械 / Pharma, Medical Devices
+               - 工业 / Industrial: 机械、制造 / Machinery, Manufacturing
+               - 材料 / Materials: 化工、建材 / Chemicals, Construction Materials
+               - 能源 / Energy: 煤炭、石油 / Coal, Oil
+               - 公用事业 / Utilities: 电力、水务 / Power, Water
+               - 房地产 / Real Estate: 地产、物业 / Property, Property Management
+               - 电信 / Telecom: 运营商 / Carriers
+               - 其他 / Other
+
+            2. **风格因子 / Style Factors (5类 / 5 categories)**
+               - 市值 / Market Cap: 超大/大/中/小/微 / Mega/Large/Mid/Small/Micro
+               - 估值 / Valuation: 深度价值/价值/平衡/成长 / Deep Value/Value/Balanced/Growth
+               - 波动率 / Volatility: 低/中/高 / Low/Medium/High
+               - 动量 / Momentum: 强势/正/中性/负/反转 / Strong/Positive/Neutral/Negative/Reversal
+
+            3. **市场环境 / Market Regime (4种 / 4 states)**
+               - 牛市 / Bull: 趋势向上 / Uptrend
+               - 熊市 / Bear: 趋势向下 / Downtrend
+               - 震荡 / Sideways: 横盘整理 / Consolidation
+               - 高波动 / Volatile: 剧烈波动 / High volatility
+
+            **模型架构 / Model Architecture:**
+            ```
+            输入序列 (OHLCV) / Input Sequence
+                ↓
+            [共享CNN骨干网 / Shared CNN Backbone] → 提取通用技术形态 / Extract patterns
+                ↓
+            [共享LSTM骨干网 / Shared LSTM Backbone] → 学习时序依赖 / Learn temporal dependencies
+                ↓
+            [骨干特征 / Backbone Features] ────────┐
+                                                  │
+            [行业嵌入 / Industry Embedding (32维)] ────┤
+            [风格嵌入 / Style Embedding (16维)] ────────┤→ [融合层 / Fusion] → [预测头 / Prediction Head]
+            [环境嵌入 / Regime Embedding (16维)] ───────┘
+            ```
+
+            **训练模式 / Training Modes:**
+
+            1. **统一条件化模型 / Unified Conditional Model (推荐 / RECOMMENDED)**
+               - 一个模型学习所有行业 / One model learns all industries
+               - 通过条件输入区分不同类型股票 / Distinguishes stock types via conditional inputs
+               - 优势 / Advantages:
+                 * 效率高 / High efficiency: 只需训练一个模型 / Train only one model
+                 * 性能好 / Better performance: 学习跨行业共性 / Learns cross-industry patterns
+                 * 泛化强 / Strong generalization: 自动建立维度间关联 / Auto-learns dimension correlations
+
+            2. **单行业模型 / Single Industry Model**
+               - 针对特定行业训练专门模型 / Train specialized model for specific industry
+               - 适用场景 / Use cases:
+                 * 行业特定策略 / Industry-specific strategies
+                 * 深度行业研究 / Deep industry research
+
+            **数据要求 / Data Requirements:**
+            - 数据源 / Source: `full_stock_data/training_data/`
+            - 格式 / Format: CSV (date, open, high, low, close, volume)
+            - 最少股票数 / Min stocks: 10 (测试 / testing)
+            - 推荐股票数 / Recommended: 100-500 (生产 / production)
+            """)
+
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### 📊 股票池分析 / Universe Analysis")
+                    analyze_max_stocks = gr.Slider(
+                        10, 5000, value=100, step=10,
+                        label="分析股票数 / Max Stocks to Analyze",
+                        info="分析行业分布和风格特征 / Analyze industry distribution and style factors"
+                    )
+                    analyze_btn = gr.Button("📊 分析股票池 / Analyze Universe", variant="secondary", size="lg")
+
+                    with gr.Row():
+                        analysis_output = gr.Textbox(label="分析结果 / Analysis Results", lines=15)
+
+                    with gr.Row():
+                        analysis_plot = gr.Plot(label="Industry & Style Distribution")
+
+                with gr.Column():
+                    gr.Markdown("### ⚙️ 训练配置 / Training Configuration")
+
+                    training_mode = gr.Radio(
+                        ["Unified Conditional Model", "Single Industry Model"],
+                        value="Unified Conditional Model",
+                        label="训练模式 / Training Mode",
+                        info="统一模型(推荐) vs 单行业模型 / Unified (Recommended) vs Single Industry"
+                    )
+
+                    industry_filter = gr.Dropdown(
+                        ["all", "finance", "consumer", "technology", "healthcare", "industrial",
+                         "materials", "energy", "utilities", "real_estate", "telecom", "other"],
+                        value="all",
+                        label="行业筛选 / Industry Filter",
+                        info="仅单行业模式有效 / Only for Single Industry mode"
+                    )
+
+                    multi_max_stocks = gr.Slider(
+                        10, 5000, value=100, step=10,
+                        label="最大股票数 / Max Stocks",
+                        info="测试:10-50, 生产:100-500, 大规模:500-5000 / Test:10-50, Prod:100-500, Large:500-5000"
+                    )
+                    multi_batch_size = gr.Slider(
+                        8, 128, value=64, step=8,
+                        label="批次大小 / Batch Size",
+                        info="RTX 5090推荐64-128 / RTX 5090: 64-128"
+                    )
+                    multi_epochs = gr.Slider(
+                        1, 100, value=20, step=1,
+                        label="训练轮数 / Epochs",
+                        info="通常20-50轮 / Usually 20-50"
+                    )
+                    multi_lr = gr.Number(
+                        value=0.001,
+                        label="学习率 / Learning Rate",
+                        info="默认0.001 / Default 0.001"
+                    )
+
+                    multi_use_amp = gr.Checkbox(
+                        value=True,
+                        label="混合精度训练 / Mixed Precision (AMP)",
+                        info="使用FP16加速训练，降低显存占用 / Use FP16 for faster training and lower VRAM"
+                    )
+
+                    multi_loss_type = gr.Dropdown(
+                        ["MSE", "Trend Aware", "Huber Trend", "Directional"],
+                        value="Trend Aware",
+                        label="损失函数 / Loss Function",
+                        info="MSE:标准 / Trend Aware:趋势感知(推荐) / Huber:鲁棒 / Directional:方向"
+                    )
+
+                    multi_save_interval = gr.Slider(
+                        1, 20, value=5, step=1,
+                        label="保存间隔 / Save Interval (epochs)",
+                        info="每N个epoch保存一次模型 / Save model every N epochs"
+                    )
+
+                    multi_model_name = gr.Textbox(
+                        value="multi_dim_model",
+                        label="模型名称 / Model Name",
+                        info="自动添加时间戳 / Timestamp will be added automatically"
+                    )
+
+                    multi_output_dir = gr.Textbox(
+                        value="checkpoints",
+                        label="输出路径 / Output Directory",
+                        info="模型保存目录 / Directory to save models"
+                    )
+
+                    multi_train_btn = gr.Button("🚀 开始多维度训练 / Start Multi-Dim Training", variant="primary", size="lg")
+
+            with gr.Row():
+                with gr.Column():
+                    multi_train_output = gr.Textbox(label="Training Log", lines=15, max_lines=20)
+                with gr.Column():
+                    multi_plot_output = gr.Plot(label="Real-time Training Curve")
+
+            analyze_btn.click(
+                fn=analyze_universe,
+                inputs=[analyze_max_stocks],
+                outputs=[analysis_output, analysis_plot]
+            )
+
+            multi_train_btn.click(
+                fn=train_multi_dim_model,
+                inputs=[
+                    training_mode, industry_filter, multi_max_stocks, multi_batch_size,
+                    multi_epochs, multi_lr, multi_use_amp, multi_loss_type, multi_save_interval,
+                    multi_model_name, multi_output_dir
+                ],
+                outputs=[multi_train_output, multi_plot_output]
+            )
+
+    gr.Markdown("""
+    ---
+    ## 💡 使用提示 / Tips
+
+    ### 📥 数据下载 / Data Download
+    - **首次使用 / First Time**: 先下载100只股票测试 / Download 100 stocks for testing
+    - **生产环境 / Production**: 下载500-5000只股票 / Download 500-5000 stocks
+    - **数据更新 / Update**: 定期重新下载获取最新数据 / Re-download periodically for latest data
+    - **存储位置 / Storage**: `full_stock_data/training_data/` 目录 / directory
+
+    ### 🎯 基础训练 / Basic Training
+    - **Transformer**: 复杂模式，使用Flash Attention加速 / Complex patterns, uses Flash Attention
+    - **LSTM**: 简单快速，适合基础序列 / Simple and fast, good for basic sequences
+    - **批次大小 / Batch Size**: 越大越快(GPU内存允许) / Larger = faster (if GPU allows)
+    - **学习率 / Learning Rate**: 0.001默认，0.0001微调 / 0.001 default, 0.0001 for fine-tuning
+    - **合成数据 / Synthetic Data**: 仅用于快速测试模型架构 / Only for quick architecture testing
+
+    ### 🎨 多维度训练 / Multi-Dimensional Training
+    - **统一条件化模型 / Unified Conditional Model**:
+      * 一个模型学习所有行业 / One model learns all industries
+      * 通过条件输入区分股票类型 / Distinguishes via conditional inputs
+      * **推荐使用 / RECOMMENDED** - 效率高、性能好、泛化强 / High efficiency, better performance, strong generalization
+
+    - **单行业模型 / Single Industry Model**:
+      * 针对特定行业训练 / Train for specific industry
+      * 适合行业特定策略 / Good for industry-specific strategies
+
+    - **行业分类 / Industry Classification**: 11类 / 11 categories
+      * 金融、消费、科技、医药、工业、材料、能源、公用事业、房地产、电信、其他
+      * Finance, Consumer, Technology, Healthcare, Industrial, Materials, Energy, Utilities, Real Estate, Telecom, Other
+
+    - **风格因子 / Style Factors**: 5类 / 5 categories
+      * 市值、估值、波动率、动量 / Market cap, Valuation, Volatility, Momentum
+
+    - **市场环境 / Market Regime**: 4种 / 4 states
+      * 牛市、熊市、震荡、高波动 / Bull, Bear, Sideways, Volatile
+
+    - **数据要求 / Data Requirements**:
+      * 最少10只股票(测试) / Min 10 stocks (testing)
+      * 推荐100-500只(生产) / Recommended 100-500 (production)
+      * 使用真实A股数据 / Uses real A-share data
+
+    ### 🎯 Flash Attention 优势 / Benefits
+    - ⚡ 训练速度提升2-4倍 / 2-4x faster training
+    - 💾 内存占用更低 / Lower memory usage
+    - 📈 长序列扩展性更好 / Better scaling for long sequences
+    - 🚀 RTX 5090完美支持 / Perfect support on RTX 5090
+
+    ### 📊 训练建议 / Training Recommendations
+    1. **数据准备 / Data Preparation**: 先下载数据 → 分析股票池 / Download data → Analyze universe
+    2. **快速测试 / Quick Test**: 10-50只股票，10轮训练 / 10-50 stocks, 10 epochs
+    3. **生产训练 / Production**: 100-500只股票，20-50轮训练 / 100-500 stocks, 20-50 epochs
+    4. **模型选择 / Model Selection**: 多维度训练优于基础训练 / Multi-dim better than basic
+    5. **性能监控 / Performance**: 关注验证损失，避免过拟合 / Watch validation loss, avoid overfitting
+
+    ### 🔧 硬件配置 / Hardware Configuration
+    - **GPU**: NVIDIA RTX 5090 (32GB VRAM)
+    - **CUDA**: 12.8
+    - **推荐批次大小 / Recommended Batch Size**: 64-128
+    - **训练速度 / Training Speed**: ~88 it/s
+
+    ---
+    **作者 / Author**: eddy | **版本 / Version**: 2.0 | **更新 / Updated**: 2025-11-14
+    """)
+
+if __name__ == "__main__":
+    demo.launch(
+        share=False,
+        server_name="127.0.0.1",
+        server_port=7860,
+        show_api=False,
+        quiet=False,
+        inbrowser=False
+    )
+
