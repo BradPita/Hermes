@@ -106,16 +106,70 @@ def get_available_checkpoints():
     return sorted(all_checkpoints)
 
 
+def normalize_stock_code(code):
+    """
+    Normalize stock code with intelligent prefix detection
+
+    A-Share Stock Code Rules:
+        Shanghai (SH):
+            600xxx - Main Board (large caps)
+            601xxx - Main Board (large caps)
+            603xxx - Main Board (IPO)
+            605xxx - Main Board (new)
+            688xxx - STAR Market (tech)
+
+        Shenzhen (SZ):
+            000xxx - Main Board
+            001xxx - Main Board (new)
+            002xxx - SME Board (mid caps)
+            003xxx - SME Board (new)
+            300xxx - ChiNext (growth/tech)
+            301xxx - ChiNext (new)
+
+    Examples:
+        '600017' -> 'SH600017'
+        '000001' -> 'SZ000001'
+        '300750' -> 'SZ300750'
+        'SH600017' -> 'SH600017' (unchanged)
+    """
+    if not code:
+        return code
+
+    code = code.strip().upper()
+
+    if code.startswith('SH') or code.startswith('SZ'):
+        return code
+
+    if len(code) == 6 and code.isdigit():
+        first_char = code[0]
+        first_three = code[:3]
+
+        if first_char == '6':
+            return f'SH{code}'
+        elif first_three in ['688']:
+            return f'SH{code}'
+        elif first_char in ['0', '3']:
+            return f'SZ{code}'
+        elif first_three in ['002', '003', '300', '301']:
+            return f'SZ{code}'
+        else:
+            return f'SH{code}'
+
+    return code
+
+
 def get_stock_info(stock_code):
     """Get information about a specific stock"""
     if not stock_code or stock_code == "No stocks available - Please download data first":
         return "Please select a valid stock code"
 
+    stock_code = normalize_stock_code(stock_code)
+
     data_dir = "full_stock_data/training_data"
     stock_file = os.path.join(data_dir, f"{stock_code}.csv")
 
     if not os.path.exists(stock_file):
-        return f"Stock data file not found: {stock_code}"
+        return f"Stock data file not found: {stock_code}\n\nTip: Try entering just the 6-digit code (e.g., 600017 or 000001)"
 
     try:
         data = pd.read_csv(stock_file)
@@ -892,7 +946,7 @@ def build_cache_for_training(max_stocks=100, use_gpu=True):
 
 
 def train_multi_dim_model(mode, industry, max_stocks, batch_size, epochs, lr,
-                          use_amp=True, loss_type="Trend Aware", save_interval=5,
+                          use_amp=True, loss_type="Trend Aware", save_interval=5, early_stopping_patience=50,
                           model_name="multi_dim_model", output_dir="checkpoints", use_cache=True, use_compile=False):
     """Train conditional multi dimensional model with real-time curve updates"""
     global global_trainer, training_status
@@ -919,6 +973,7 @@ def train_multi_dim_model(mode, industry, max_stocks, batch_size, epochs, lr,
         config.training.num_epochs = int(epochs)
         config.training.learning_rate = float(lr)
         config.training.use_amp = bool(use_amp)
+        config.training.early_stopping_patience = int(early_stopping_patience)
 
         save_interval = int(save_interval)
 
@@ -1126,6 +1181,7 @@ def train_multi_dim_model(mode, industry, max_stocks, batch_size, epochs, lr,
             f"Model Name: {model_name_with_timestamp}\n"
             f"Output Dir: {output_dir}\n"
             f"Save Interval: Every {save_interval} epochs\n"
+            f"Early Stopping Patience: {config.training.early_stopping_patience} epochs\n"
             f"Loss Function: {loss_type} ({config.training.loss_type})\n"
             f"Data dir: {data_dir} (CSV files: {len(data_files)})\n"
             f"Stocks used this run: {len(stock_codes)}\n"
@@ -1376,9 +1432,184 @@ def upload_data_and_predict(file, checkpoint_path):
     except Exception as e:
         return f"Error: {str(e)}", None
 
-def predict_single_stock(stock_code, future_days, checkpoint_path):
-    """Predict future prices for a single stock"""
+def scan_stock_pool(max_stocks, prediction_days, checkpoint_path, min_increase_pct, progress=gr.Progress()):
+    """
+    Scan stock pool and rank by upward probability
+
+    Returns stocks ranked by predicted increase percentage
+    """
     try:
+        if not os.path.exists(checkpoint_path):
+            return "Error: Checkpoint not found. Please train a model first.", None
+
+        data_dir = "full_stock_data/training_data"
+        if not os.path.exists(data_dir):
+            return "Error: Data directory not found.", None
+
+        all_stocks = get_available_stocks()
+        if not all_stocks:
+            return "Error: No stocks available.", None
+
+        max_stocks = int(max_stocks)
+        prediction_days = int(prediction_days)
+        min_increase_pct = float(min_increase_pct)
+
+        stocks_to_scan = all_stocks[:max_stocks]
+
+        predictor = ConditionalPredictor(checkpoint_path)
+
+        results = []
+
+        for idx, stock_code in enumerate(stocks_to_scan):
+            progress((idx + 1) / len(stocks_to_scan), desc=f"Scanning {stock_code}")
+
+            try:
+                stock_file = os.path.join(data_dir, f"{stock_code}.csv")
+                data = pd.read_csv(stock_file)
+
+                if len(data) < 60:
+                    continue
+
+                predictions, metadata = predictor.predict_stock(
+                    stock_code=stock_code,
+                    recent_data=data,
+                    future_steps=prediction_days
+                )
+
+                current_price = metadata['last_price']
+                predicted_price = predictions[-1]
+                increase_pct = ((predicted_price - current_price) / current_price) * 100
+
+                if increase_pct >= min_increase_pct:
+                    avg_daily_increase = increase_pct / prediction_days
+
+                    upward_days = sum(1 for i in range(len(predictions)) if predictions[i] > (current_price if i == 0 else predictions[i-1]))
+                    upward_probability = (upward_days / len(predictions)) * 100
+
+                    results.append({
+                        'rank': 0,
+                        'stock_code': stock_code,
+                        'industry_l1': metadata['industry_l1'],
+                        'industry_l2': metadata['industry_l2'],
+                        'style': metadata['style'],
+                        'regime': metadata['regime'],
+                        'current_price': current_price,
+                        'predicted_price': predicted_price,
+                        'increase_pct': increase_pct,
+                        'avg_daily_increase': avg_daily_increase,
+                        'upward_probability': upward_probability,
+                        'volatility': metadata['volatility']
+                    })
+
+            except Exception as e:
+                continue
+
+        if not results:
+            return "No stocks meet the criteria. Try lowering the minimum increase percentage.", None
+
+        results_df = pd.DataFrame(results)
+        results_df = results_df.sort_values('increase_pct', ascending=False)
+        results_df['rank'] = range(1, len(results_df) + 1)
+
+        results_df = results_df[[
+            'rank', 'stock_code', 'industry_l1', 'industry_l2', 'style', 'regime',
+            'current_price', 'predicted_price', 'increase_pct', 'avg_daily_increase',
+            'upward_probability', 'volatility'
+        ]]
+
+        summary_text = f"""
+Stock Pool Screening Results
+{'='*80}
+Total Scanned: {len(stocks_to_scan)} stocks
+Qualified Stocks: {len(results_df)} stocks
+Prediction Horizon: {prediction_days} days
+Min Increase Filter: {min_increase_pct}%
+
+Top 10 Recommendations:
+{'='*80}
+"""
+
+        for idx, row in results_df.head(10).iterrows():
+            summary_text += f"""
+Rank {row['rank']}: {row['stock_code']}
+  Industry: {row['industry_l1']} / {row['industry_l2']}
+  Style: {row['style']} | Regime: {row['regime']}
+  Current Price: {row['current_price']:.2f}
+  Predicted Price ({prediction_days}d): {row['predicted_price']:.2f}
+  Expected Gain: {row['increase_pct']:.2f}% (avg {row['avg_daily_increase']:.2f}%/day)
+  Upward Probability: {row['upward_probability']:.1f}%
+  Volatility: {row['volatility']:.4f}
+"""
+
+        summary_text += f"\n{'='*80}\n"
+        summary_text += "Full results table displayed below.\n"
+
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=(
+                'Top 20 by Expected Gain',
+                'Industry Distribution',
+                'Style Distribution',
+                'Market Regime Distribution'
+            ),
+            specs=[
+                [{"type": "bar"}, {"type": "pie"}],
+                [{"type": "pie"}, {"type": "pie"}]
+            ]
+        )
+
+        top_20 = results_df.head(20)
+
+        fig.add_trace(go.Bar(
+            x=top_20['stock_code'],
+            y=top_20['increase_pct'],
+            name='Expected Gain %',
+            marker_color='green',
+            text=top_20['increase_pct'].round(2),
+            textposition='outside'
+        ), row=1, col=1)
+
+        industry_counts = results_df['industry_l1'].value_counts()
+        fig.add_trace(go.Pie(
+            labels=industry_counts.index,
+            values=industry_counts.values,
+            name='Industry'
+        ), row=1, col=2)
+
+        style_counts = results_df['style'].value_counts()
+        fig.add_trace(go.Pie(
+            labels=style_counts.index,
+            values=style_counts.values,
+            name='Style'
+        ), row=2, col=1)
+
+        regime_counts = results_df['regime'].value_counts()
+        fig.add_trace(go.Pie(
+            labels=regime_counts.index,
+            values=regime_counts.values,
+            name='Regime'
+        ), row=2, col=2)
+
+        fig.update_layout(
+            title=f'Stock Pool Analysis - {len(results_df)} Qualified Stocks',
+            showlegend=False,
+            height=800
+        )
+
+        fig.update_xaxes(tickangle=-45, row=1, col=1)
+
+        return summary_text, fig, results_df
+
+    except Exception as e:
+        import traceback
+        return f"Error: {str(e)}\n\n{traceback.format_exc()}", None, None
+
+
+def backtest_model(stock_code, test_days, checkpoint_path):
+    """Backtest model on historical data"""
+    try:
+        stock_code = normalize_stock_code(stock_code)
+
         if not os.path.exists(checkpoint_path):
             return "Error: Checkpoint not found. Please train a model first.", None
 
@@ -1386,7 +1617,154 @@ def predict_single_stock(stock_code, future_days, checkpoint_path):
         stock_file = os.path.join(data_dir, f"{stock_code}.csv")
 
         if not os.path.exists(stock_file):
-            return f"Error: Stock data not found for {stock_code}", None
+            return f"Error: Stock data not found for {stock_code}\n\nTip: Enter 6-digit code only (e.g., 600017 or 000001)", None
+
+        data = pd.read_csv(stock_file)
+
+        if len(data) < 120:
+            return f"Error: Not enough data for {stock_code} (need at least 120 rows)", None
+
+        predictor = ConditionalPredictor(checkpoint_path)
+
+        test_days = int(test_days)
+        test_days = min(test_days, len(data) - 60)
+
+        backtest_data = data.iloc[-(60 + test_days):].copy()
+
+        predictions = []
+        actuals = []
+        dates = []
+
+        for i in range(test_days):
+            historical_window = backtest_data.iloc[:60 + i]
+
+            pred, metadata = predictor.predict_stock(
+                stock_code=stock_code,
+                recent_data=historical_window,
+                future_steps=1
+            )
+
+            actual_price = backtest_data.iloc[60 + i]['close']
+
+            predictions.append(pred[0])
+            actuals.append(actual_price)
+            dates.append(i + 1)
+
+        predictions = np.array(predictions)
+        actuals = np.array(actuals)
+
+        rmse = np.sqrt(np.mean((predictions - actuals) ** 2))
+        mae = np.mean(np.abs(predictions - actuals))
+        mape = np.mean(np.abs((predictions - actuals) / actuals)) * 100
+
+        direction_actual = np.diff(actuals) > 0
+        direction_pred = np.diff(predictions) > 0
+        direction_accuracy = np.mean(direction_actual == direction_pred) * 100
+
+        fig = make_subplots(
+            rows=2, cols=1,
+            row_heights=[0.7, 0.3],
+            vertical_spacing=0.05,
+            subplot_titles=(f'{stock_code} Backtest: Predicted vs Actual', 'Prediction Error')
+        )
+
+        fig.add_trace(go.Scatter(
+            x=dates,
+            y=actuals,
+            mode='lines+markers',
+            name='Actual Price',
+            line=dict(color='blue', width=2),
+            marker=dict(size=6)
+        ), row=1, col=1)
+
+        fig.add_trace(go.Scatter(
+            x=dates,
+            y=predictions,
+            mode='lines+markers',
+            name='Predicted Price',
+            line=dict(color='red', width=2, dash='dash'),
+            marker=dict(size=6)
+        ), row=1, col=1)
+
+        errors = predictions - actuals
+        colors = ['red' if e > 0 else 'green' for e in errors]
+
+        fig.add_trace(go.Bar(
+            x=dates,
+            y=errors,
+            name='Prediction Error',
+            marker_color=colors,
+            showlegend=False
+        ), row=2, col=1)
+
+        fig.update_layout(
+            title=f'{stock_code} Backtesting Results ({test_days} days)',
+            xaxis2_title='Day',
+            yaxis_title='Price',
+            yaxis2_title='Error',
+            hovermode='x unified',
+            template='plotly_white',
+            height=800
+        )
+
+        fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
+        fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
+
+        result = f"""
+Backtesting Results
+{'='*60}
+Stock Code: {stock_code}
+Test Period: {test_days} days
+Model: {checkpoint_path}
+
+Performance Metrics:
+{'='*60}
+RMSE (Root Mean Square Error): {rmse:.4f}
+MAE (Mean Absolute Error): {mae:.4f}
+MAPE (Mean Absolute Percentage Error): {mape:.2f}%
+Direction Accuracy: {direction_accuracy:.2f}%
+
+Price Statistics:
+{'='*60}
+Actual Price Range: {actuals.min():.2f} - {actuals.max():.2f}
+Predicted Price Range: {predictions.min():.2f} - {predictions.max():.2f}
+Mean Actual Price: {actuals.mean():.2f}
+Mean Predicted Price: {predictions.mean():.2f}
+
+Error Statistics:
+{'='*60}
+Max Overestimation: {errors.max():.4f} ({errors.max()/actuals.mean()*100:.2f}%)
+Max Underestimation: {errors.min():.4f} ({errors.min()/actuals.mean()*100:.2f}%)
+Mean Error: {errors.mean():.4f}
+
+Interpretation:
+{'='*60}
+- RMSE closer to 0 is better (measures overall error magnitude)
+- MAE shows average absolute error in price units
+- MAPE shows percentage error (< 5% is good, < 10% is acceptable)
+- Direction Accuracy > 50% means better than random guess
+"""
+
+        return result, fig
+
+    except Exception as e:
+        import traceback
+        return f"Error: {str(e)}\n\n{traceback.format_exc()}", None
+
+
+def predict_single_stock(stock_code, future_days, checkpoint_path):
+    """Predict future prices for a single stock with K-line chart and volume"""
+    try:
+        stock_code = normalize_stock_code(stock_code)
+
+        if not os.path.exists(checkpoint_path):
+            return "Error: Checkpoint not found. Please train a model first.", None
+
+        data_dir = "full_stock_data/training_data"
+        stock_file = os.path.join(data_dir, f"{stock_code}.csv")
+
+        if not os.path.exists(stock_file):
+            return f"Error: Stock data not found for {stock_code}\n\nTip: Enter 6-digit code only (e.g., 600017 or 000001)", None
 
         data = pd.read_csv(stock_file)
 
@@ -1401,37 +1779,93 @@ def predict_single_stock(stock_code, future_days, checkpoint_path):
             future_steps=int(future_days)
         )
 
-        fig = make_subplots(rows=1, cols=1)
+        historical_data = data.tail(60).copy()
+        historical_data['date_index'] = list(range(-len(historical_data), 0))
 
-        historical_prices = data['close'].tail(60).values
-        historical_dates = list(range(-len(historical_prices), 0))
+        predicted_ohlcv = metadata['predicted_ohlcv']
         future_dates = list(range(1, len(predictions) + 1))
+        predicted_ohlcv['date_index'] = future_dates
 
-        fig.add_trace(go.Scatter(
-            x=historical_dates,
-            y=historical_prices,
-            mode='lines',
-            name='Historical',
-            line=dict(color='blue', width=2)
-        ))
+        fig = make_subplots(
+            rows=2, cols=1,
+            row_heights=[0.7, 0.3],
+            vertical_spacing=0.03,
+            subplot_titles=(f'{stock_code} K-Line Chart with Predictions', 'Volume'),
+            shared_xaxes=True
+        )
 
-        last_price = historical_prices[-1]
+        fig.add_trace(go.Candlestick(
+            x=historical_data['date_index'],
+            open=historical_data['open'],
+            high=historical_data['high'],
+            low=historical_data['low'],
+            close=historical_data['close'],
+            name='Historical K-Line',
+            increasing_line_color='red',
+            decreasing_line_color='green',
+            showlegend=True
+        ), row=1, col=1)
+
+        fig.add_trace(go.Candlestick(
+            x=predicted_ohlcv['date_index'],
+            open=predicted_ohlcv['open'],
+            high=predicted_ohlcv['high'],
+            low=predicted_ohlcv['low'],
+            close=predicted_ohlcv['close'],
+            name='Predicted K-Line',
+            increasing_line_color='rgba(255, 140, 0, 0.6)',
+            decreasing_line_color='rgba(0, 200, 100, 0.6)',
+            showlegend=True
+        ), row=1, col=1)
+
+        last_close = historical_data['close'].iloc[-1]
         fig.add_trace(go.Scatter(
             x=[0] + future_dates,
-            y=[last_price] + list(predictions),
+            y=[last_close] + list(predictions),
             mode='lines+markers',
-            name='Predicted',
-            line=dict(color='red', width=2, dash='dash'),
-            marker=dict(size=8)
-        ))
+            name='Predicted Close Line',
+            line=dict(color='orange', width=2, dash='dot'),
+            marker=dict(size=8, symbol='star'),
+            showlegend=True
+        ), row=1, col=1)
+
+        hist_colors = ['red' if historical_data['close'].iloc[i] >= historical_data['open'].iloc[i]
+                       else 'green' for i in range(len(historical_data))]
+
+        fig.add_trace(go.Bar(
+            x=historical_data['date_index'],
+            y=historical_data['volume'],
+            name='Historical Volume',
+            marker_color=hist_colors,
+            showlegend=False,
+            opacity=0.7
+        ), row=2, col=1)
+
+        pred_colors = ['rgba(255, 140, 0, 0.5)' if predicted_ohlcv['close'].iloc[i] >= predicted_ohlcv['open'].iloc[i]
+                       else 'rgba(0, 200, 100, 0.5)' for i in range(len(predicted_ohlcv))]
+
+        fig.add_trace(go.Bar(
+            x=predicted_ohlcv['date_index'],
+            y=predicted_ohlcv['volume'],
+            name='Predicted Volume',
+            marker_color=pred_colors,
+            showlegend=False,
+            opacity=0.7
+        ), row=2, col=1)
 
         fig.update_layout(
-            title=f'{stock_code} Price Prediction',
-            xaxis_title='Days (0=Today)',
+            title=f'{stock_code} Price Prediction with K-Line',
+            xaxis2_title='Days (0=Today)',
             yaxis_title='Price',
+            yaxis2_title='Volume',
             hovermode='x unified',
-            template='plotly_white'
+            template='plotly_white',
+            height=800,
+            xaxis_rangeslider_visible=False
         )
+
+        fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
+        fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
 
         result = f"""
 Stock Prediction Results
@@ -1637,22 +2071,27 @@ with gr.Blocks(title="A-Share Multi-Dimensional Financial Model", theme=gr.theme
             gr.Markdown("## Model Inference")
 
             with gr.Row():
-                available_checkpoints_infer = get_available_checkpoints()
-                default_ckpt_infer = "financial_model/checkpoints/best_model.pt"
-                if default_ckpt_infer not in available_checkpoints_infer:
-                    available_checkpoints_infer = [
-                        default_ckpt_infer,
-                        *[p for p in available_checkpoints_infer if p != default_ckpt_infer],
-                    ]
+                with gr.Column():
+                    available_checkpoints_infer = get_available_checkpoints()
+                    default_ckpt_infer = "financial_model/checkpoints/best_model.pt"
+                    if default_ckpt_infer not in available_checkpoints_infer:
+                        available_checkpoints_infer = [
+                            default_ckpt_infer,
+                            *[p for p in available_checkpoints_infer if p != default_ckpt_infer],
+                        ]
 
-                checkpoint_path = gr.Dropdown(
-                    choices=available_checkpoints_infer,
-                    value=available_checkpoints_infer[0] if available_checkpoints_infer else default_ckpt_infer,
-                    label="Checkpoint Path",
-                    info="Select an existing checkpoint or type a custom path",
-                    allow_custom_value=True,
-                )
-                test_samples = gr.Slider(100, 1000, value=200, step=50, label="Test Samples")
+                    checkpoint_path = gr.Dropdown(
+                        choices=available_checkpoints_infer,
+                        value=available_checkpoints_infer[0] if available_checkpoints_infer else default_ckpt_infer,
+                        label="Checkpoint Path",
+                        info="Select an existing checkpoint or type a custom path",
+                        allow_custom_value=True,
+                    )
+
+                    refresh_ckpt_infer_btn = gr.Button("🔄 Refresh Checkpoint List", variant="secondary", size="sm")
+
+                with gr.Column():
+                    test_samples = gr.Slider(100, 1000, value=200, step=50, label="Test Samples")
 
             inference_btn = gr.Button("🔮 Run Inference", variant="primary", size="lg")
 
@@ -1661,6 +2100,11 @@ with gr.Blocks(title="A-Share Multi-Dimensional Financial Model", theme=gr.theme
 
             with gr.Row():
                 inference_plot = gr.Plot(label="Predictions vs Actual")
+
+            refresh_ckpt_infer_btn.click(
+                fn=lambda: gr.update(choices=get_available_checkpoints()),
+                outputs=checkpoint_path
+            )
 
             inference_btn.click(
                 fn=run_inference,
@@ -1687,13 +2131,23 @@ with gr.Blocks(title="A-Share Multi-Dimensional Financial Model", theme=gr.theme
                     if not available_stocks_predict:
                         available_stocks_predict = ["No stocks available"]
 
-                    stock_code_predict_dropdown = gr.Dropdown(
-                        choices=available_stocks_predict,
-                        value=available_stocks_predict[0] if available_stocks_predict else None,
-                        label="Stock Code",
-                        info=f"Select from {len(available_stocks_predict)} available stocks",
-                        allow_custom_value=False
-                    )
+                    with gr.Row():
+                        stock_code_predict_dropdown = gr.Textbox(
+                            value=available_stocks_predict[0] if available_stocks_predict else "",
+                            label="Stock Code (Smart Input)",
+                            info=f"Just type 6 digits + Enter / 只输入6位数字+回车 (e.g., 600017, 000001) | {len(available_stocks_predict)} stocks",
+                            placeholder="600017, 000001, 300001...",
+                            scale=3
+                        )
+
+                        stock_code_selector = gr.Dropdown(
+                            choices=available_stocks_predict,
+                            value=available_stocks_predict[0] if available_stocks_predict else None,
+                            label="Or Select",
+                            info="Quick select",
+                            scale=2,
+                            allow_custom_value=False
+                        )
 
                     stock_info_predict_display = gr.Textbox(
                         label="Stock Data Info",
@@ -1702,10 +2156,13 @@ with gr.Blocks(title="A-Share Multi-Dimensional Financial Model", theme=gr.theme
                         value=get_stock_info(available_stocks_predict[0]) if available_stocks_predict else ""
                     )
 
-                    future_days_input = gr.Slider(
-                        1, 30, value=5, step=1,
+                    future_days_input = gr.Number(
+                        value=5,
+                        minimum=1,
+                        maximum=30,
+                        step=1,
                         label="Future Days to Predict",
-                        info="Number of days to predict into the future"
+                        info="Press Enter to predict / 按回车键快速推理"
                     )
 
                     available_checkpoints_single = get_available_checkpoints()
@@ -1724,6 +2181,8 @@ with gr.Blocks(title="A-Share Multi-Dimensional Financial Model", theme=gr.theme
                         allow_custom_value=True,
                     )
 
+                    refresh_ckpt_single_btn = gr.Button("🔄 Refresh Checkpoint List", variant="secondary", size="sm")
+
                 with gr.Column():
                     predict_single_btn = gr.Button("🔮 Predict Future", variant="primary", size="lg")
 
@@ -1733,11 +2192,22 @@ with gr.Blocks(title="A-Share Multi-Dimensional Financial Model", theme=gr.theme
                 outputs=[stock_info_predict_display]
             )
 
-            with gr.Row():
-                single_stock_output = gr.Textbox(label="Prediction Results", lines=15)
+            stock_code_selector.change(
+                fn=lambda x: (x, get_stock_info(x)),
+                inputs=[stock_code_selector],
+                outputs=[stock_code_predict_dropdown, stock_info_predict_display]
+            )
+
+            refresh_ckpt_single_btn.click(
+                fn=lambda: gr.update(choices=get_available_checkpoints()),
+                outputs=checkpoint_path_single
+            )
 
             with gr.Row():
-                single_stock_plot = gr.Plot(label="Historical vs Predicted Prices")
+                single_stock_plot = gr.Plot(label="K-Line Chart with Predictions")
+
+            with gr.Row():
+                single_stock_output = gr.Textbox(label="Prediction Results", lines=15)
 
             predict_single_btn.click(
                 fn=predict_single_stock,
@@ -1745,34 +2215,280 @@ with gr.Blocks(title="A-Share Multi-Dimensional Financial Model", theme=gr.theme
                 outputs=[single_stock_output, single_stock_plot]
             )
 
+            stock_code_predict_dropdown.submit(
+                fn=predict_single_stock,
+                inputs=[stock_code_predict_dropdown, future_days_input, checkpoint_path_single],
+                outputs=[single_stock_output, single_stock_plot]
+            )
+
+            future_days_input.submit(
+                fn=predict_single_stock,
+                inputs=[stock_code_predict_dropdown, future_days_input, checkpoint_path_single],
+                outputs=[single_stock_output, single_stock_plot]
+            )
+
+        with gr.Tab("🎯 Stock Pool / 智能选股"):
+            gr.Markdown("""
+            ## 🎯 Intelligent Stock Screening / 智能股票池
+
+            **Automatically scan and rank stocks by upward potential**
+
+            **功能说明：**
+            - 批量扫描股票池，自动预测每只股票的未来走势
+            - 按预期涨幅排序，筛选出最具潜力的股票
+            - 显示行业、风格、市场环境等多维度信息
+            - 生成可视化分析报告
+
+            **How it works:**
+            1. Scan specified number of stocks from your pool
+            2. Predict future price for each stock (configurable horizon)
+            3. Calculate expected gain percentage
+            4. Rank stocks by expected return
+            5. Filter by minimum gain threshold
+
+            **Use Cases:**
+            - **Daily Stock Selection**: Find best opportunities each morning
+            - **Portfolio Construction**: Build diversified portfolio
+            - **Sector Rotation**: Identify hot sectors
+            - **Risk Management**: Avoid stocks with predicted decline
+            """)
+
+            with gr.Row():
+                with gr.Column():
+                    scan_max_stocks = gr.Number(
+                        value=100,
+                        minimum=10,
+                        maximum=5000,
+                        step=10,
+                        label="Max Stocks to Scan / 扫描股票数",
+                        info="More stocks = better coverage but slower (Recommended: 100-500, Max: 5000)"
+                    )
+
+                    scan_prediction_days = gr.Number(
+                        value=5,
+                        minimum=1,
+                        maximum=20,
+                        step=1,
+                        label="Prediction Horizon (days) / 预测周期",
+                        info="How many days ahead to predict"
+                    )
+
+                    scan_min_increase = gr.Number(
+                        value=2.0,
+                        minimum=0.0,
+                        maximum=20.0,
+                        step=0.5,
+                        label="Min Expected Gain (%) / 最低预期涨幅",
+                        info="Filter out stocks below this threshold"
+                    )
+
+                    available_checkpoints_pool = get_available_checkpoints()
+                    default_ckpt_pool = "checkpoints/multi_dim_model_20251115_014201_best.pt"
+                    if default_ckpt_pool not in available_checkpoints_pool:
+                        available_checkpoints_pool = [
+                            default_ckpt_pool,
+                            *[p for p in available_checkpoints_pool if p != default_ckpt_pool],
+                        ]
+
+                    checkpoint_path_pool = gr.Dropdown(
+                        choices=available_checkpoints_pool,
+                        value=available_checkpoints_pool[0] if available_checkpoints_pool else default_ckpt_pool,
+                        label="Checkpoint Path",
+                        info="Path to trained conditional model",
+                        allow_custom_value=True,
+                    )
+
+                    refresh_ckpt_pool_btn = gr.Button("🔄 Refresh Checkpoint List", variant="secondary", size="sm")
+
+                with gr.Column():
+                    scan_btn = gr.Button("🎯 Scan Stock Pool", variant="primary", size="lg")
+                    gr.Markdown("""
+                    **Tips:**
+                    - Start with 100 stocks for quick results
+                    - Use 5-day horizon for short-term trading
+                    - Set min gain to 2-5% to filter noise
+                    - Larger scans take longer but find more opportunities
+                    """)
+
+            refresh_ckpt_pool_btn.click(
+                fn=lambda: gr.update(choices=get_available_checkpoints()),
+                outputs=checkpoint_path_pool
+            )
+
+            with gr.Row():
+                pool_plot = gr.Plot(label="Stock Pool Analysis")
+
+            with gr.Row():
+                pool_output = gr.Textbox(label="Screening Results", lines=20)
+
+            with gr.Row():
+                pool_table = gr.Dataframe(
+                    label="Full Results Table (Sortable)",
+                    headers=[
+                        'Rank', 'Stock Code', 'Industry L1', 'Industry L2', 'Style', 'Regime',
+                        'Current Price', 'Predicted Price', 'Increase %', 'Avg Daily %',
+                        'Upward Prob %', 'Volatility'
+                    ],
+                    interactive=False,
+                    wrap=True
+                )
+
+            scan_btn.click(
+                fn=scan_stock_pool,
+                inputs=[scan_max_stocks, scan_prediction_days, checkpoint_path_pool, scan_min_increase],
+                outputs=[pool_output, pool_plot, pool_table]
+            )
+
+        with gr.Tab("📊 Backtesting"):
+            gr.Markdown("""
+            ## 📊 Historical Backtesting / 历史回测
+
+            **Test your model's performance on historical data**
+
+            **功能说明：**
+            - 在历史数据上验证模型准确性
+            - 使用滑动窗口逐日预测，模拟真实交易场景
+            - 计算多种性能指标评估模型质量
+
+            **How it works:**
+            1. Select a stock and test period (e.g., last 30 days)
+            2. Model predicts each day using only data available up to that point
+            3. Compare predictions with actual prices
+            4. Calculate performance metrics
+
+            **Metrics Explained:**
+            - **RMSE**: Overall prediction error (lower is better)
+            - **MAE**: Average absolute error in price units
+            - **MAPE**: Percentage error (< 5% excellent, < 10% good)
+            - **Direction Accuracy**: % of correct up/down predictions (> 50% beats random)
+            """)
+
+            with gr.Row():
+                with gr.Column():
+                    available_stocks_backtest = get_available_stocks()
+                    if not available_stocks_backtest:
+                        available_stocks_backtest = ["No stocks available"]
+
+                    with gr.Row():
+                        stock_code_backtest = gr.Textbox(
+                            value=available_stocks_backtest[0] if available_stocks_backtest else "",
+                            label="Stock Code (Smart Input)",
+                            info=f"Type 6 digits + Enter / 输入6位数字+回车 | {len(available_stocks_backtest)} stocks",
+                            placeholder="600017, 000001, 300001...",
+                            scale=3
+                        )
+
+                        stock_code_backtest_selector = gr.Dropdown(
+                            choices=available_stocks_backtest,
+                            value=available_stocks_backtest[0] if available_stocks_backtest else None,
+                            label="Or Select",
+                            info="Quick select",
+                            scale=2,
+                            allow_custom_value=False
+                        )
+
+                    test_days_input = gr.Number(
+                        value=30,
+                        minimum=5,
+                        maximum=100,
+                        step=1,
+                        label="Test Days / 回测天数",
+                        info="Press Enter to run backtest / 按回车开始回测"
+                    )
+
+                    available_checkpoints_backtest = get_available_checkpoints()
+                    default_ckpt_backtest = "checkpoints/multi_dim_model_20251115_014201_best.pt"
+                    if default_ckpt_backtest not in available_checkpoints_backtest:
+                        available_checkpoints_backtest = [
+                            default_ckpt_backtest,
+                            *[p for p in available_checkpoints_backtest if p != default_ckpt_backtest],
+                        ]
+
+                    checkpoint_path_backtest = gr.Dropdown(
+                        choices=available_checkpoints_backtest,
+                        value=available_checkpoints_backtest[0] if available_checkpoints_backtest else default_ckpt_backtest,
+                        label="Checkpoint Path",
+                        info="Path to trained conditional model",
+                        allow_custom_value=True,
+                    )
+
+                    refresh_ckpt_backtest_btn = gr.Button("🔄 Refresh Checkpoint List", variant="secondary", size="sm")
+
+                with gr.Column():
+                    backtest_btn = gr.Button("📊 Run Backtest", variant="primary", size="lg")
+
+            stock_code_backtest_selector.change(
+                fn=lambda x: x,
+                inputs=[stock_code_backtest_selector],
+                outputs=[stock_code_backtest]
+            )
+
+            refresh_ckpt_backtest_btn.click(
+                fn=lambda: gr.update(choices=get_available_checkpoints()),
+                outputs=checkpoint_path_backtest
+            )
+
+            with gr.Row():
+                backtest_plot = gr.Plot(label="Backtest Results: Predicted vs Actual")
+
+            with gr.Row():
+                backtest_output = gr.Textbox(label="Performance Metrics", lines=25)
+
+            backtest_btn.click(
+                fn=backtest_model,
+                inputs=[stock_code_backtest, test_days_input, checkpoint_path_backtest],
+                outputs=[backtest_output, backtest_plot]
+            )
+
+            stock_code_backtest.submit(
+                fn=backtest_model,
+                inputs=[stock_code_backtest, test_days_input, checkpoint_path_backtest],
+                outputs=[backtest_output, backtest_plot]
+            )
+
+            test_days_input.submit(
+                fn=backtest_model,
+                inputs=[stock_code_backtest, test_days_input, checkpoint_path_backtest],
+                outputs=[backtest_output, backtest_plot]
+            )
+
         with gr.Tab("📁 Custom Data"):
             gr.Markdown("## Upload Your Data for Prediction")
             gr.Markdown("CSV format: `date,open,high,low,close,volume`")
 
             with gr.Row():
-                file_input = gr.File(label="Upload CSV File", file_types=[".csv"])
+                with gr.Column():
+                    file_input = gr.File(label="Upload CSV File", file_types=[".csv"])
 
-                available_checkpoints_custom = get_available_checkpoints()
-                default_ckpt_custom = "financial_model/checkpoints/best_model.pt"
-                if default_ckpt_custom not in available_checkpoints_custom:
-                    available_checkpoints_custom = [
-                        default_ckpt_custom,
-                        *[p for p in available_checkpoints_custom if p != default_ckpt_custom],
-                    ]
+                with gr.Column():
+                    available_checkpoints_custom = get_available_checkpoints()
+                    default_ckpt_custom = "financial_model/checkpoints/best_model.pt"
+                    if default_ckpt_custom not in available_checkpoints_custom:
+                        available_checkpoints_custom = [
+                            default_ckpt_custom,
+                            *[p for p in available_checkpoints_custom if p != default_ckpt_custom],
+                        ]
 
-                checkpoint_path_custom = gr.Dropdown(
-                    choices=available_checkpoints_custom,
-                    value=available_checkpoints_custom[0] if available_checkpoints_custom else default_ckpt_custom,
-                    label="Checkpoint Path",
-                    info="Select an existing checkpoint or type a custom path",
-                    allow_custom_value=True,
-                )
+                    checkpoint_path_custom = gr.Dropdown(
+                        choices=available_checkpoints_custom,
+                        value=available_checkpoints_custom[0] if available_checkpoints_custom else default_ckpt_custom,
+                        label="Checkpoint Path",
+                        info="Select an existing checkpoint or type a custom path",
+                        allow_custom_value=True,
+                    )
+
+                    refresh_ckpt_custom_btn = gr.Button("🔄 Refresh Checkpoint List", variant="secondary", size="sm")
 
             predict_btn = gr.Button("📊 Predict", variant="primary", size="lg")
 
             with gr.Row():
                 custom_output = gr.Textbox(label="Results", lines=10)
                 download_output = gr.File(label="Download Predictions")
+
+            refresh_ckpt_custom_btn.click(
+                fn=lambda: gr.update(choices=get_available_checkpoints()),
+                outputs=checkpoint_path_custom
+            )
 
             predict_btn.click(
                 fn=upload_data_and_predict,
@@ -1973,6 +2689,12 @@ with gr.Blocks(title="A-Share Multi-Dimensional Financial Model", theme=gr.theme
                         info="每N个epoch保存一次模型 / Save model every N epochs"
                     )
 
+                    multi_early_stopping_patience = gr.Slider(
+                        5, 100, value=50, step=5,
+                        label="Early Stopping Patience (epochs)",
+                        info="验证损失未改善的等待轮数，设为100可禁用 / Wait epochs before stopping, set to 100 to disable"
+                    )
+
                     multi_model_name = gr.Textbox(
                         value="multi_dim_model",
                         label="模型名称 / Model Name",
@@ -2012,7 +2734,7 @@ with gr.Blocks(title="A-Share Multi-Dimensional Financial Model", theme=gr.theme
                 inputs=[
                     training_mode, industry_filter, multi_max_stocks, multi_batch_size,
                     multi_epochs, multi_lr, multi_use_amp, multi_loss_type, multi_save_interval,
-                    multi_model_name, multi_output_dir, multi_use_cache, multi_use_compile
+                    multi_early_stopping_patience, multi_model_name, multi_output_dir, multi_use_cache, multi_use_compile
                 ],
                 outputs=[multi_train_output, multi_plot_output]
             )
